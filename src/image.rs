@@ -3775,10 +3775,10 @@ fn parse_ewf1_metadata_section(
         }
         "digest" => {
             validate_adler32_checksum(data, 76, 76, "EWF1 digest").map_err(damaged)?;
-            if let Some(hash) = parse_nonzero_hash::<16>(&data[..16]) {
+            if let Some(hash) = parse_nonzero_hash::<16>(data) {
                 insert_hash_value(targets.stored_hashes, "MD5", &hash)?;
             }
-            if let Some(hash) = parse_nonzero_hash::<20>(&data[16..36]) {
+            if let Some(hash) = data.get(16..).and_then(parse_nonzero_hash::<20>) {
                 insert_hash_value(targets.stored_hashes, "SHA1", &hash)?;
             }
         }
