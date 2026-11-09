@@ -144,7 +144,15 @@ fn missing_terminal_descriptor_is_recoverable() {
         .unwrap()
         .set_len(end + 10)
         .unwrap();
-    assert!(Image::open(&path).is_err());
+    let strict =
+        ewf_image::OpenOptions::default().with_strictness(ewf_image::OpenStrictness::Strict);
+    assert!(Image::open_with_options(&path, strict).is_err());
+    // Lenient opening keeps the complete sections, which include the tables.
+    let lenient = Image::open(&path).unwrap();
+    let mut read = vec![0; data.len()];
+    assert_eq!(lenient.read_at(&mut read, 0).unwrap(), data.len());
+    assert_eq!(read, data);
+    drop(lenient);
     let recovery = EwfRecovery::open(path, RecoveryOptions::default()).unwrap();
     let mut output = Vec::new();
     let report = recovery.recover_to_writer(&mut output).unwrap();

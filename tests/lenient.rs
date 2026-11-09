@@ -324,3 +324,193 @@ fn overlong_final_chunk_keeps_the_media_bytes() {
     };
     assert_eq!(image.verify().unwrap().computed_md5, Some(md5));
 }
+
+fn truncate(path: &Path, length: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(length)
+        .unwrap();
+}
+
+#[test]
+fn truncated_segment_keeps_its_complete_sections() {
+    let written = e01(WriteCompression::Zlib, 4);
+    let sectors = ewf1_section(&sections(&written.path), 0, "sectors");
+    truncate(&written.path, sectors.data_offset + sectors.data_size / 2);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert!(!image.info().acquisition_complete);
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(
+        image.lenient_findings()[0].segment_offset,
+        Some(sectors.descriptor_offset)
+    );
+    assert_eq!(image.lenient_findings()[1].chunk_index, Some(0));
+    // The tables followed the sectors section, so no chunk can be located.
+    assert_eq!(readable_chunks(&image, &written.data), 0);
+}
+
+#[test]
+fn truncation_after_the_tables_keeps_every_chunk() {
+    let written = e01(WriteCompression::Zlib, 4);
+    let digest = ewf1_section(&sections(&written.path), 0, "digest");
+    truncate(&written.path, digest.data_offset + 10);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(kinds(&image), [IntegrityFindingKind::TruncatedSegment]);
+    assert!(!image.info().acquisition_complete);
+    assert_eq!(readable_chunks(&image, &written.data), 4);
+}
+
+/// Five segments of two raw chunks each, then one of a single chunk.
+fn multi_segment_e01() -> Written {
+    write_image(
+        "image.E01",
+        WriteFormat::Ewf1Physical,
+        WriteCompression::None,
+        &media(9),
+        |options| options.maximum_segment_size = Some(70_000),
+    )
+}
+
+#[test]
+fn segments_after_a_truncated_segment_are_placed_from_the_end() {
+    let written = multi_segment_e01();
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(image.number_of_segments(), 5);
+    let second = image.segment_filename(1).unwrap().to_path_buf();
+    let sectors = ewf1_section(image.sections(), 1, "sectors");
+    drop(image);
+    truncate(&second, sectors.data_offset + 100);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    let gap = &image.lenient_findings()[1];
+    assert_eq!(gap.chunk_index, Some(2));
+    assert!(gap.message.contains("chunks 2 to 3"), "{}", gap.message);
+    // Segment 2's chunks fail; the segments after it count back from the end.
+    assert_eq!(readable_chunks(&image, &written.data), 7);
+    assert!(image.info().acquisition_complete);
+}
+
+#[test]
+fn segments_after_a_damaged_segment_are_not_placed_without_a_complete_end() {
+    let written = multi_segment_e01();
+    let image = Image::open(&written.path).unwrap();
+    let second = image.segment_filename(1).unwrap().to_path_buf();
+    let last = image.segment_filename(4).unwrap().to_path_buf();
+    let second_sectors = ewf1_section(image.sections(), 1, "sectors");
+    let last_digest = ewf1_section(image.sections(), 4, "digest");
+    drop(image);
+    truncate(&second, second_sectors.data_offset + 100);
+    truncate(&last, last_digest.data_offset + 1);
+
+    let image = Image::open(&written.path).unwrap();
+    assert!(!image.info().acquisition_complete);
+    let findings = image.lenient_findings();
+    let unplaced: Vec<_> = findings
+        .iter()
+        .filter(|finding| {
+            finding.kind == IntegrityFindingKind::ChunksUnavailable
+                && finding.segment_index.is_some()
+        })
+        .map(|finding| finding.segment_index.unwrap())
+        .collect();
+    assert_eq!(unplaced, [2, 3, 4]);
+    // Only the first segment's chunks have a known position.
+    assert_eq!(readable_chunks(&image, &written.data), 2);
+}
+
+fn descriptor_offset(path: &Path, segment: usize, name: &str) -> u64 {
+    ewf1_section(&sections(path), segment, name).descriptor_offset
+}
+
+#[test]
+fn damaged_descriptor_with_consistent_offsets_is_followed() {
+    let written = e01(WriteCompression::Zlib, 3);
+    // A byte of the descriptor's padding: only the checksum notices.
+    flip(
+        &written.path,
+        descriptor_offset(&written.path, 0, "sectors") + 40,
+    );
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(readable_chunks(&image, &written.data), 3);
+}
+
+#[test]
+fn damaged_descriptor_size_is_derived_from_an_intact_next_descriptor() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let volume = descriptor_offset(&written.path, 0, "volume");
+    modify(&written.path, |bytes| {
+        let size = usize::try_from(volume).unwrap() + 24;
+        bytes[size..size + 4].copy_from_slice(&[0xff; 4]);
+    });
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(image.sections()[0].data_size, 1052);
+    assert_eq!(readable_chunks(&image, &written.data), 3);
+}
+
+#[test]
+fn damaged_sectors_type_name_still_locates_the_chunks() {
+    let written = e01(WriteCompression::Zlib, 3);
+    flip(
+        &written.path,
+        descriptor_offset(&written.path, 0, "sectors") + 1,
+    );
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(readable_chunks(&image, &written.data), 3);
+}
+
+#[test]
+fn damaged_descriptor_with_inconsistent_offsets_stops_the_segment() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let table = descriptor_offset(&written.path, 0, "table");
+    modify(&written.path, |bytes| {
+        let start = usize::try_from(table).unwrap() + 16;
+        // Both the next offset and the size, so neither leads anywhere.
+        bytes[start..start + 16].copy_from_slice(&[0x7f; 16]);
+    });
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(image.lenient_findings()[0].segment_offset, Some(table));
+    assert_eq!(readable_chunks(&image, &written.data), 0);
+}

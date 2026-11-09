@@ -10,8 +10,17 @@ use crate::{EwfError, OpenStrictness, Result};
 /// Category of a tolerated defect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefectKind {
+    /// A segment ends inside a section; data past the end is unavailable.
+    TruncatedSegment,
+    /// A damaged section descriptor stopped the section chain of a segment.
+    BrokenSectionChain,
+    /// A stored structure checksum failed; the values were checked another way
+    /// or replaced by an intact copy.
+    ChecksumMismatch,
     /// A damaged metadata section was ignored.
     MetadataUnavailable,
+    /// Chunks that cannot be located; reading them fails.
+    ChunksUnavailable,
     /// A chunk decoded to more bytes than the media holds; the extra bytes were dropped.
     OverlongChunk,
     /// Another irregularity that lenient opening accepted.

@@ -27,10 +27,27 @@ pub(crate) struct LazyChunkIndex {
 }
 
 impl LazyChunkIndex {
-    pub(crate) fn new(
+    /// Builds an index whose ranges cover every logical chunk exactly once.
+    pub(crate) fn new(ranges: Vec<TableRange>, logical_size: u64, chunk_size: u64) -> Result<Self> {
+        Self::build(ranges, logical_size, chunk_size, false)
+    }
+
+    /// Builds an index whose ranges may leave chunks uncovered, as after lenient
+    /// opening of a damaged image. Uncovered chunks fail when read. Ranges must
+    /// still not overlap or extend past the logical media.
+    pub(crate) fn with_gaps(
+        ranges: Vec<TableRange>,
+        logical_size: u64,
+        chunk_size: u64,
+    ) -> Result<Self> {
+        Self::build(ranges, logical_size, chunk_size, true)
+    }
+
+    fn build(
         mut ranges: Vec<TableRange>,
         logical_size: u64,
         chunk_size: u64,
+        allow_gaps: bool,
     ) -> Result<Self> {
         let logical_chunks = logical_chunk_count(logical_size, chunk_size)?;
         ranges.sort_by_key(|range| range.first_chunk);
@@ -46,7 +63,7 @@ impl LazyChunkIndex {
                     range.first_chunk, expected_next
                 )));
             }
-            if range.first_chunk > expected_next {
+            if range.first_chunk > expected_next && !allow_gaps {
                 return Err(EwfError::Malformed(format!(
                     "table range starts at chunk {}, expected {}",
                     range.first_chunk, expected_next
@@ -58,7 +75,7 @@ impl LazyChunkIndex {
                 .ok_or_else(|| EwfError::Malformed("table range chunk count overflow".into()))?;
         }
 
-        if expected_next != logical_chunks {
+        if expected_next > logical_chunks || (expected_next < logical_chunks && !allow_gaps) {
             return Err(EwfError::Malformed(format!(
                 "table coverage ends at chunk {expected_next}, expected {logical_chunks}"
             )));
@@ -73,6 +90,22 @@ impl LazyChunkIndex {
     #[cfg(test)]
     pub(crate) fn logical_chunks(&self) -> u64 {
         self.logical_chunks
+    }
+
+    /// Chunk ranges `[first, end)` that no table range covers.
+    pub(crate) fn gaps(&self) -> Vec<(u64, u64)> {
+        let mut gaps = Vec::new();
+        let mut covered_to = 0_u64;
+        for range in &self.ranges {
+            if range.first_chunk > covered_to {
+                gaps.push((covered_to, range.first_chunk));
+            }
+            covered_to = range.first_chunk.saturating_add(range.chunk_count);
+        }
+        if covered_to < self.logical_chunks {
+            gaps.push((covered_to, self.logical_chunks));
+        }
+        gaps
     }
 
     #[cfg(test)]
@@ -95,7 +128,12 @@ impl LazyChunkIndex {
             .get(index)
             .filter(|range| chunk_id >= range.first_chunk)
             .map(|range| (index, range))
-            .ok_or_else(|| EwfError::Malformed(format!("chunk {chunk_id} is not covered")))
+            .ok_or_else(|| {
+                EwfError::Malformed(format!(
+                    "chunk {chunk_id} is not covered by any chunk table; its table is missing \
+                     or could not be placed"
+                ))
+            })
     }
 
     #[cfg(test)]
@@ -158,6 +196,7 @@ mod tests {
             LazyChunkIndex::new(vec![range(0, 2), range(2, 3)], 5 * 32_768, 32_768).unwrap();
 
         assert_eq!(index.logical_chunks(), 5);
+        assert_eq!(index.gaps(), []);
         assert_eq!(index.range_for(0).unwrap().first_chunk, 0);
         assert_eq!(index.range_for(4).unwrap().first_chunk, 2);
     }
@@ -210,6 +249,29 @@ mod tests {
         assert_eq!(index.logical_chunks(), chunks);
         assert_eq!(index.range_count(), 1);
         assert_eq!(index.range_for(chunks - 1).unwrap().first_chunk, 0);
+    }
+
+    #[test]
+    fn index_with_gaps_fails_only_uncovered_chunks() {
+        let index =
+            LazyChunkIndex::with_gaps(vec![range(0, 2), range(4, 1)], 6 * 32_768, 32_768).unwrap();
+
+        assert_eq!(index.range_index_for(1).unwrap().0, 0);
+        assert!(index.range_index_for(2).is_err());
+        assert!(index.range_index_for(3).is_err());
+        assert_eq!(index.range_index_for(4).unwrap().0, 1);
+        assert!(index.range_index_for(5).is_err());
+        assert_eq!(index.gaps(), [(2, 4), (5, 6)]);
+        let empty = LazyChunkIndex::with_gaps(Vec::new(), 32_768, 32_768).unwrap();
+        assert_eq!(empty.gaps(), [(0, 1)]);
+    }
+
+    #[test]
+    fn index_with_gaps_still_rejects_overlap_and_excess_coverage() {
+        assert!(
+            LazyChunkIndex::with_gaps(vec![range(0, 2), range(1, 2)], 4 * 32_768, 32_768).is_err()
+        );
+        assert!(LazyChunkIndex::with_gaps(vec![range(0, 3)], 2 * 32_768, 32_768).is_err());
     }
 
     #[test]

@@ -592,7 +592,11 @@ impl Image {
         let mut format_profile = None;
         let mut format_profile_hint_only = false;
         let mut next_ewf1_chunk = 0_u64;
-        let mut discovered_table_chunks = 0_u64;
+        // EWF1 tables do not record their first chunk, so a segment's chunks
+        // follow from the counts of all earlier segments. After a segment whose
+        // section chain stopped early, later segments wait in `unplaced_ewf1`.
+        let mut ewf1_positions_known = true;
+        let mut unplaced_ewf1 = Vec::new();
         let mut expected_set_identifier: Option<[u8; 16]> = None;
         let mut expected_ewf1_media = None;
         let mut expected_ewf1_compression_method = None;
@@ -622,7 +626,11 @@ impl Image {
                     &paths[0],
                     segment_index,
                     Ewf1SegmentContext {
-                        first_chunk: next_ewf1_chunk,
+                        first_chunk: if ewf1_positions_known {
+                            next_ewf1_chunk
+                        } else {
+                            0
+                        },
                         inherited_media_geometry: expected_ewf1_media,
                     },
                     &mut leniency,
@@ -742,20 +750,20 @@ impl Image {
                 acquisition_complete = parsed.acquisition_complete;
             }
             merge_hashes(&mut stored_hashes, &parsed.stored_hashes)?;
+            if parsed.format == Format::Ewf1 && !ewf1_positions_known {
+                unplaced_ewf1.push(UnplacedEwf1Segment {
+                    segment_index,
+                    ranges: parsed.ranges,
+                    chunk_count: parsed.table_chunk_count,
+                    complete: parsed.ewf1_chain_complete,
+                });
+                continue;
+            }
             if parsed.format == Format::Ewf1 {
                 next_ewf1_chunk = next_ewf1_chunk
                     .checked_add(parsed.table_chunk_count)
                     .ok_or_else(|| EwfError::Malformed("EWF1 chunk count overflow".into()))?;
-            }
-            for range in &parsed.ranges {
-                discovered_table_chunks = discovered_table_chunks.max(
-                    range
-                        .first_chunk
-                        .checked_add(range.chunk_count)
-                        .ok_or_else(|| {
-                            EwfError::Malformed("table range chunk count overflow".into())
-                        })?,
-                );
+                ewf1_positions_known = parsed.ewf1_chain_complete;
             }
             ranges.extend(parsed.ranges);
         }
@@ -783,13 +791,42 @@ impl Image {
             ));
         }
 
+        if !unplaced_ewf1.is_empty() {
+            let total_chunks = (logical_size > 0 && chunk_size > 0)
+                .then(|| crate::index::logical_chunk_count(logical_size, chunk_size))
+                .transpose()?;
+            place_ewf1_segments_from_end(
+                unplaced_ewf1,
+                total_chunks.filter(|_| acquisition_complete),
+                next_ewf1_chunk,
+                &mut ranges,
+                &mut leniency,
+            )?;
+        }
+        let mut discovered_table_chunks = 0_u64;
+        for range in &ranges {
+            discovered_table_chunks = discovered_table_chunks.max(
+                range
+                    .first_chunk
+                    .checked_add(range.chunk_count)
+                    .ok_or_else(|| {
+                        EwfError::Malformed("table range chunk count overflow".into())
+                    })?,
+            );
+        }
         if logical_size == 0 && chunk_size > 0 {
             logical_size = chunk_size
                 .checked_mul(discovered_table_chunks)
                 .ok_or_else(|| EwfError::Malformed("logical size overflow".into()))?;
         }
         if discovered_table_chunks > 0 {
-            media.chunk_count = Some(discovered_table_chunks);
+            // Missing tables leave fewer discovered chunks than the media holds.
+            let media_chunks = if chunk_size > 0 {
+                crate::index::logical_chunk_count(logical_size, chunk_size)?
+            } else {
+                0
+            };
+            media.chunk_count = Some(discovered_table_chunks.max(media_chunks));
         }
         if let Some((expected_size, committed_size)) = acquisition_prefix {
             if format != Format::Ewf1
@@ -828,7 +865,26 @@ impl Image {
             sessions,
             tracks,
         };
-        let index = LazyChunkIndex::new(ranges, info.logical_size, info.chunk_size)?;
+        let index = if leniency.is_lenient() {
+            let index = LazyChunkIndex::with_gaps(ranges, info.logical_size, info.chunk_size)?;
+            for (first, end) in index.gaps() {
+                leniency.push(Defect {
+                    kind: DefectKind::ChunksUnavailable,
+                    message: format!(
+                        "chunks {first} to {} ({} chunks) have no usable chunk table; \
+                         reading them fails",
+                        end - 1,
+                        end - first
+                    ),
+                    segment_index: None,
+                    segment_offset: None,
+                    chunk_index: Some(first),
+                });
+            }
+            index
+        } else {
+            LazyChunkIndex::new(ranges, info.logical_size, info.chunk_size)?
+        };
         let chunk_size = usize::try_from(info.chunk_size)
             .map_err(|_| EwfError::Malformed("chunk size does not fit usize".into()))?;
         let cache_entries = match options.chunk_cache_capacity() {
@@ -2852,6 +2908,9 @@ struct ParsedSegment {
     media: MediaInfo,
     ranges: Vec<TableRange>,
     table_chunk_count: u64,
+    /// EWF1: the section chain was followed to its end, so `table_chunk_count`
+    /// is the segment's chunk count rather than a lower bound.
+    ewf1_chain_complete: bool,
     metadata: EwfMetadata,
     stored_hashes: StoredHashes,
     acquisition_errors: Vec<AcquisitionError>,
@@ -2891,10 +2950,70 @@ struct Ewf1SegmentContext {
     inherited_media_geometry: Option<Ewf1MediaGeometry>,
 }
 
+/// An EWF1 segment parsed after a segment whose chunk count is unknown. Its
+/// ranges are numbered from zero until its position is known.
+struct UnplacedEwf1Segment {
+    segment_index: usize,
+    ranges: Vec<TableRange>,
+    chunk_count: u64,
+    complete: bool,
+}
+
+/// Places EWF1 segments that follow a damaged segment by counting back from the
+/// end of the media. This is sound only when the media's chunk count is known
+/// and every segment counted back over is complete, so `total_chunks` is `None`
+/// unless the last segment ends the acquisition. Segments that cannot be placed
+/// are left out, and their chunks fail when read.
+fn place_ewf1_segments_from_end(
+    unplaced: Vec<UnplacedEwf1Segment>,
+    total_chunks: Option<u64>,
+    placed_end: u64,
+    ranges: &mut Vec<TableRange>,
+    leniency: &mut Leniency,
+) -> Result<()> {
+    let mut end = total_chunks;
+    let mut placed = Vec::new();
+    let mut remaining = unplaced;
+    while let Some(segment) = remaining.pop() {
+        let start = end
+            .filter(|_| segment.complete)
+            .and_then(|end| end.checked_sub(segment.chunk_count))
+            .filter(|start| *start >= placed_end);
+        let Some(start) = start else {
+            remaining.push(segment);
+            break;
+        };
+        for mut range in segment.ranges {
+            range.first_chunk = range
+                .first_chunk
+                .checked_add(start)
+                .ok_or_else(|| EwfError::Malformed("EWF1 chunk count overflow".into()))?;
+            placed.push(range);
+        }
+        end = Some(start);
+    }
+    for segment in remaining {
+        leniency.record(
+            DefectKind::ChunksUnavailable,
+            Some(segment.segment_index),
+            None,
+            format!(
+                "the position of segment {}'s {} chunks in the media is unknown because an \
+                 earlier segment is damaged; reading them fails",
+                segment.segment_index + 1,
+                segment.chunk_count
+            ),
+        );
+    }
+    ranges.extend(placed);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct Ewf1RangeProfile {
     allow_large_compressed_chunks: bool,
     compression_method: CompressionMethod,
+    lenient: bool,
 }
 
 #[derive(Clone)]
@@ -2936,9 +3055,11 @@ fn parse_ewf1_segment(
         inherited_media_geometry,
     } = context;
 
-    let sections = scan_ewf1_sections(file)?;
+    let chain = scan_ewf1_sections(file, segment_index, leniency)?;
+    let acquisition_complete = ewf1_acquisition_complete(&chain);
+    let chain_complete = chain.complete;
+    let sections = chain.sections;
     let compression_method = detect_ewf1_compression_method(file_header, &sections)?;
-    let acquisition_complete = ewf1_acquisition_complete(&sections);
     let volume = sections
         .iter()
         .find(|section| {
@@ -3099,10 +3220,13 @@ fn parse_ewf1_segment(
         &sections,
         segment_index,
         first_chunk,
-        logical_size,
+        // A segment cut short may have lost its tables; the gap is reported once
+        // the whole image is indexed.
+        if chain_complete { logical_size } else { 0 },
         Ewf1RangeProfile {
             allow_large_compressed_chunks: volume.as_ref().is_some_and(|volume| volume.smart),
             compression_method,
+            lenient: leniency.is_lenient(),
         },
         statistics,
     )?;
@@ -3138,6 +3262,7 @@ fn parse_ewf1_segment(
         media,
         ranges,
         table_chunk_count,
+        ewf1_chain_complete: chain_complete,
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -3738,6 +3863,7 @@ fn parse_ewf2_segment(
         media,
         ranges,
         table_chunk_count,
+        ewf1_chain_complete: true,
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -3755,32 +3881,106 @@ fn parse_ewf2_segment(
     })
 }
 
-fn scan_ewf1_sections(file: &mut dyn SegmentReader) -> Result<Vec<Section>> {
+/// EWF1 sections in chain order.
+struct Ewf1Chain {
+    sections: Vec<Section>,
+    /// False when lenient opening stopped at a truncated or damaged descriptor,
+    /// so that later sections of the segment, and their chunk tables, are unknown.
+    complete: bool,
+}
+
+fn scan_ewf1_sections(
+    file: &mut dyn SegmentReader,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Ewf1Chain> {
+    const REST_IGNORED: &str = "the rest of the segment is ignored";
     let file_len = file.segment_len()?;
     let mut sections = Vec::new();
     let mut offset = ewf1::FILE_HEADER_SIZE as u64;
+    let incomplete = |sections| {
+        Ok(Ewf1Chain {
+            sections,
+            complete: false,
+        })
+    };
     loop {
         let descriptor_end = offset
             .checked_add(ewf1::SECTION_DESCRIPTOR_SIZE as u64)
             .ok_or_else(|| EwfError::Malformed("EWF1 section descriptor overflow".into()))?;
         if descriptor_end > file_len {
-            return Err(EwfError::Malformed(
-                "EWF1 section descriptor exceeds file".into(),
-            ));
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 section descriptor exceeds file".into()),
+                DefectKind::TruncatedSegment,
+                segment_index,
+                offset,
+                "the segment ends there and the sections after it are missing",
+            )?;
+            return incomplete(sections);
         }
         let mut buf = [0; ewf1::SECTION_DESCRIPTOR_SIZE];
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(&mut buf)?;
-        validate_present_adler32_checksum(&buf, 72, 72, "EWF1 section descriptor")?;
-        let desc = ewf1::SectionDescriptor::parse(&buf, offset)?;
-        let data_size = desc.data_size()?;
-        let data_offset = descriptor_end;
-        let data_end = data_offset
-            .checked_add(data_size)
-            .ok_or_else(|| EwfError::Malformed("EWF1 section data exceeds file".into()))?;
-        if data_end > file_len {
-            return Err(EwfError::Malformed("EWF1 section data exceeds file".into()));
+        let mut desc = ewf1::SectionDescriptor::parse(&buf, offset)?;
+        if let Err(error) =
+            validate_present_adler32_checksum(&buf, 72, 72, "EWF1 section descriptor")
+        {
+            if !leniency.is_lenient() {
+                return Err(error);
+            }
+            let Some(repaired) = repair_ewf1_descriptor(file, &desc, file_len)? else {
+                leniency.tolerate(
+                    error,
+                    DefectKind::BrokenSectionChain,
+                    segment_index,
+                    offset,
+                    "its size and next offset do not agree, so the rest of the segment is \
+                     ignored",
+                )?;
+                return incomplete(sections);
+            };
+            leniency.tolerate(
+                error,
+                DefectKind::ChecksumMismatch,
+                segment_index,
+                offset,
+                &format!(
+                    "its offsets agree with the section chain, so it was followed as a {:?} \
+                     section",
+                    repaired.section_type
+                ),
+            )?;
+            desc = repaired;
         }
+        let data_size = match desc.data_size() {
+            Ok(size) => size,
+            Err(error) => {
+                leniency.tolerate(
+                    error,
+                    DefectKind::BrokenSectionChain,
+                    segment_index,
+                    offset,
+                    REST_IGNORED,
+                )?;
+                return incomplete(sections);
+            }
+        };
+        let data_offset = descriptor_end;
+        let data_end = data_offset.checked_add(data_size);
+        let Some(data_end) = data_end.filter(|end| *end <= file_len) else {
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 section data exceeds file".into()),
+                DefectKind::TruncatedSegment,
+                segment_index,
+                offset,
+                &format!(
+                    "the segment ends inside this {:?} section; it and the sections after it \
+                     are missing",
+                    desc.section_type
+                ),
+            )?;
+            return incomplete(sections);
+        };
         let section_type = desc.section_type.clone();
         let next = desc.next;
         sections.push(Section {
@@ -3789,26 +3989,104 @@ fn scan_ewf1_sections(file: &mut dyn SegmentReader) -> Result<Vec<Section>> {
             data_size,
         });
         if matches!(section_type.as_str(), "done" | "next") || next == 0 {
-            return Ok(sections);
+            return Ok(Ewf1Chain {
+                sections,
+                complete: true,
+            });
         }
         if next <= offset {
-            return Err(EwfError::Malformed(
-                "EWF1 section chain does not advance".into(),
-            ));
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 section chain does not advance".into()),
+                DefectKind::BrokenSectionChain,
+                segment_index,
+                offset,
+                REST_IGNORED,
+            )?;
+            return incomplete(sections);
         }
         if next < data_end {
-            return Err(EwfError::Malformed(
-                "EWF1 next section offset overlaps current section".into(),
-            ));
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 next section offset overlaps current section".into()),
+                DefectKind::BrokenSectionChain,
+                segment_index,
+                offset,
+                REST_IGNORED,
+            )?;
+            return incomplete(sections);
         }
         offset = next;
     }
 }
 
-fn ewf1_acquisition_complete(sections: &[Section]) -> bool {
-    sections
-        .last()
-        .is_none_or(|section| section.desc.section_type != "next")
+/// Interprets an EWF1 section descriptor whose checksum failed. Writers place the
+/// next descriptor directly after a section, so `next == offset + size`. When
+/// both fields agree the descriptor is used as stored; when they disagree, the
+/// field that leads to an intact descriptor is trusted and the other derived
+/// from it. Otherwise the descriptor cannot be followed.
+fn repair_ewf1_descriptor(
+    file: &mut dyn SegmentReader,
+    desc: &ewf1::SectionDescriptor,
+    file_len: u64,
+) -> Result<Option<ewf1::SectionDescriptor>> {
+    let offset = desc.offset;
+    let descriptor_size = ewf1::SECTION_DESCRIPTOR_SIZE as u64;
+    if matches!(desc.section_type.as_str(), "done" | "next") {
+        let terminal = (desc.size == 0 || desc.size == descriptor_size)
+            && (desc.next == offset || desc.next == 0);
+        return Ok(terminal.then(|| desc.clone()));
+    }
+    let by_size = Some(desc.size)
+        .filter(|size| *size >= descriptor_size)
+        .and_then(|size| offset.checked_add(size));
+    if by_size == Some(desc.next) {
+        return Ok(Some(desc.clone()));
+    }
+    let size_leads_to_descriptor = match by_size {
+        Some(target) => intact_ewf1_descriptor_at(file, target, file_len)?,
+        None => false,
+    };
+    let next_leads_to_descriptor = desc.next >= offset.saturating_add(descriptor_size)
+        && intact_ewf1_descriptor_at(file, desc.next, file_len)?;
+    Ok(match (size_leads_to_descriptor, next_leads_to_descriptor) {
+        (true, false) => by_size.map(|next| ewf1::SectionDescriptor {
+            next,
+            ..desc.clone()
+        }),
+        (false, true) => Some(ewf1::SectionDescriptor {
+            size: desc.next - offset,
+            ..desc.clone()
+        }),
+        _ => None,
+    })
+}
+
+/// True when a descriptor with a stored, matching checksum starts at `offset`.
+fn intact_ewf1_descriptor_at(
+    file: &mut dyn SegmentReader,
+    offset: u64,
+    file_len: u64,
+) -> Result<bool> {
+    let descriptor_size = ewf1::SECTION_DESCRIPTOR_SIZE as u64;
+    if offset
+        .checked_add(descriptor_size)
+        .is_none_or(|end| end > file_len)
+    {
+        return Ok(false);
+    }
+    let bytes = read_exact_at(file, offset, descriptor_size)?;
+    let stored = bytes
+        .get(72..76)
+        .and_then(|value| <[u8; 4]>::try_from(value).ok())
+        .map(u32::from_le_bytes);
+    Ok(stored.is_some_and(|stored| stored != 0 && bytes.get(..72).map(adler32) == Some(stored)))
+}
+
+fn ewf1_acquisition_complete(chain: &Ewf1Chain) -> bool {
+    chain.complete
+        && chain
+            .sections
+            .last()
+            .is_none_or(|section| section.desc.section_type != "next")
 }
 
 fn scan_ewf2_sections(
@@ -4290,10 +4568,23 @@ fn parse_ewf1_ranges(
         }
 
         let (data_base, data_end) = if let Some(sectors) =
-            matching_sectors_section(sections, base_offset).or_else(|| {
-                first_entry_offset
-                    .and_then(|offset| sectors_section_containing_offset(sections, offset))
-            }) {
+            matching_sectors_section(sections, base_offset)
+                .or_else(|| {
+                    first_entry_offset
+                        .and_then(|offset| sectors_section_containing_offset(sections, offset))
+                })
+                .or_else(|| {
+                    // A sectors descriptor whose damaged type name was repaired from
+                    // its offsets keeps its position: the table's base names it.
+                    (profile.lenient && base_offset != 0)
+                        .then(|| {
+                            sections.iter().find(|section| {
+                                section.desc.offset == base_offset
+                                    || sectors_section_contains_offset(section, base_offset)
+                            })
+                        })
+                        .flatten()
+                }) {
             let data_end = sectors
                 .data_offset
                 .checked_add(sectors.data_size)

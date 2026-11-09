@@ -47,9 +47,23 @@ pub enum IntegrityFindingKind {
     /// Lenient opening accepted a structural irregularity not covered by a more
     /// specific kind; the message says what was accepted.
     LenientOpen,
+    /// A segment file ends inside a section. Sections that are complete are
+    /// used; chunks whose data or table is missing fail when read.
+    TruncatedSegment,
+    /// A damaged section descriptor could not be followed, so the rest of that
+    /// segment's section chain was ignored.
+    BrokenSectionChain,
+    /// A stored checksum of a section descriptor, media geometry, or chunk table
+    /// header did not match. Lenient opening used an intact copy or values that
+    /// it could check against the rest of the image.
+    StructureChecksumMismatch,
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.
     MetadataUnavailable,
+    /// Chunks with no usable chunk table, because the table is missing from a
+    /// damaged segment or the segment's position in the media is unknown.
+    /// Reading them fails.
+    ChunksUnavailable,
     /// A chunk decoded to more bytes than the media size leaves for it. The
     /// media's bytes were kept and the extra bytes dropped.
     OverlongChunk,
@@ -150,6 +164,22 @@ impl IntegrityReport {
 
 fn defect_finding(defect: &Defect, chunk_size: u64) -> IntegrityFinding {
     let (kind, severity) = match defect.kind {
+        DefectKind::TruncatedSegment => (
+            IntegrityFindingKind::TruncatedSegment,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::BrokenSectionChain => (
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::ChecksumMismatch => (
+            IntegrityFindingKind::StructureChecksumMismatch,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::ChunksUnavailable => (
+            IntegrityFindingKind::ChunksUnavailable,
+            IntegritySeverity::Error,
+        ),
         DefectKind::MetadataUnavailable => (
             IntegrityFindingKind::MetadataUnavailable,
             IntegritySeverity::Error,

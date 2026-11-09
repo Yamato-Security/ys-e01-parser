@@ -4674,7 +4674,7 @@ fn image_open_reads_incomplete_ewf1_next_terminated_image() {
 fn image_open_rejects_ewf1_section_chain_that_does_not_advance() {
     let file = synthetic_e01_with_volume_next(13);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -4687,7 +4687,7 @@ fn image_open_rejects_ewf1_section_chain_that_does_not_advance() {
 fn image_open_rejects_ewf1_overlapping_section_chain() {
     let file = synthetic_e01_with_volume_next(13 + 76);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -4709,7 +4709,7 @@ fn image_open_rejects_ewf1_section_next_overflow() {
 fn image_open_rejects_ewf1_section_size_overflow() {
     let file = synthetic_e01_with_max_sectors_section_size();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -4892,7 +4892,7 @@ fn image_open_rejects_ewf1_table_bad_entries_checksum() {
 fn image_open_rejects_ewf1_section_bad_descriptor_checksum() {
     let file = writer_e01_with_bad_descriptor_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
