@@ -81,7 +81,8 @@ instead, which is what this fork changes.
   verifies bytes, not their logical position in the image. `OpenStrictness::Strict` keeps
   ewf-image's behaviour.
 - **An overlong last chunk**, which some writers store with more bytes than the media needs, gives
-  the media's bytes with an `OverlongChunk` warning instead of failing.
+  the media's bytes with an `OverlongChunk` warning instead of failing. A raw one is first checked
+  against its checksum over the whole stored chunk, which ewf-image didn't check.
 - **EWF2 metadata compressed with a small zlib window** is decompressed, not read as text.
 - **Read-only by default.** Writing EWF images and acquiring devices is behind the `writer`
   feature, which readers of evidence leave off. The images it reads are only opened for reading.
@@ -97,7 +98,7 @@ instead, which is what this fork changes.
 - **Damaged images:** the 750 copies above and 1,010 more (including multi-segment EWF1 and EWF2
   images), read with overflow checks on: no panic, no wrong data; 1,754 of the 1,760 open.
   `tests/lenient.rs` checks each case the fork goes past.
-- **The upstream tests:** `cargo test --all-features` runs ewf-image's tests too (664 in all).
+- **The upstream tests:** `cargo test --all-features` runs ewf-image's tests too (668 in all).
 
 One thing found on the way: libewf reads 3 chunks of an image written by the `writer` feature as
 zeros, where the Rust readers read the bytes that were written. Images written by libewf's

@@ -14,7 +14,9 @@ imported with its history. (@YamatoSecurity)
   past and reported by `Image::lenient_findings` (and first in `Image::analyze`): truncated
   segments, damaged section descriptors, volume, data and table sections (with their intact
   copies, such as `table2`), and damaged hash, digest and header sections. A chunk that can't be
-  verified fails when read. `OpenStrictness::Strict` keeps ewf-image's behaviour. (@YamatoSecurity)
+  verified fails when read, and so does every chunk of a table whose entries fail their checksum
+  without an intact copy: a chunk's own checksum doesn't show that it belongs where the table puts
+  it. `OpenStrictness::Strict` keeps ewf-image's behaviour. (@YamatoSecurity)
 - Writing EWF images and acquiring devices is behind the `writer` feature, off by default.
   (@YamatoSecurity)
 - Only the library is kept, without ewf-cli and the experimental AFF4 crate. Named
@@ -24,17 +26,11 @@ imported with its history. (@YamatoSecurity)
 
 ### Fixed
 
-- Damaged EWF1/EWF2 table entries could select another intact chunk and return
-  its bytes successfully. Reads now reject mappings whose table checksum failed
-  unless an intact replacement table exists. Payload checksums alone cannot
-  authenticate a chunk's logical position. (@YamatoSecurity)
-- Padded raw final chunks now validate the checksum over the entire stored
-  payload before returning the media prefix, reject corrupt payloads and
-  checksum trailers, and report the dropped padding. (@YamatoSecurity)
-- Writer documentation examples respect the optional `writer` feature, so
-  default and minimal reader-only doctests compile. (@YamatoSecurity)
 - An image whose last chunk decodes to more bytes than the media needs, as some writers store it,
   failed to open; the media's bytes are read and an `OverlongChunk` warning is recorded.
+  (@YamatoSecurity)
+- A raw last chunk stored with padding was returned without checking its checksum. The checksum
+  is now checked over the whole stored chunk, and the padding gets an `OverlongChunk` warning.
   (@YamatoSecurity)
 - EWF2 metadata compressed with a small zlib window was read as text, so an image could lose its
   media size. (@YamatoSecurity)
