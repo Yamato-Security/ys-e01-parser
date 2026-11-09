@@ -1107,3 +1107,98 @@ fn truncated_middle_segment_keeps_its_complete_chunks() {
     let last = *in_second.last().unwrap();
     assert!(image.read_at(&mut chunk, last * CHUNK as u64).is_err());
 }
+
+/// A single EWF2 segment with trailing descriptors: device information
+/// (`device_info` as UTF-16 text), sector data of zlib chunks, a sector table
+/// and done.
+fn build_ex01(media: &[u8], device_info: &str) -> (tempfile::TempDir, PathBuf) {
+    fn ewf2_descriptor(kind: u32, data_size: u64, previous: u64) -> [u8; 64] {
+        let mut bytes = [0_u8; 64];
+        bytes[0..4].copy_from_slice(&kind.to_le_bytes());
+        bytes[8..16].copy_from_slice(&previous.to_le_bytes());
+        bytes[16..24].copy_from_slice(&data_size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&64_u32.to_le_bytes());
+        let checksum = adler32(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+    let mut bytes = b"EVF2\x0d\x0a\x81\x00\x02\x01\x01\x00\x01\x00\x00\x00".to_vec();
+    bytes.extend([0x3c; 16]);
+    let section = |bytes: &mut Vec<u8>, kind: u32, data: &[u8], previous: &mut u64| {
+        bytes.extend(data);
+        let offset = bytes.len() as u64;
+        bytes.extend(ewf2_descriptor(kind, data.len() as u64, *previous));
+        *previous = offset;
+    };
+    let mut previous = 0;
+    let text: Vec<u8> = device_info
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    section(&mut bytes, 0x01, &text, &mut previous);
+    let sector_data_start = bytes.len() as u64;
+    let mut sector_data = Vec::new();
+    let mut entries = Vec::new();
+    for chunk in media.chunks(CHUNK) {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(chunk).unwrap();
+        let stream = encoder.finish().unwrap();
+        entries.extend((sector_data_start + sector_data.len() as u64).to_le_bytes());
+        entries.extend(u32::try_from(stream.len()).unwrap().to_le_bytes());
+        entries.extend(1_u32.to_le_bytes());
+        sector_data.extend(stream);
+    }
+    section(&mut bytes, 0x03, &sector_data, &mut previous);
+    let mut table = vec![0_u8; 32];
+    table[8..12].copy_from_slice(
+        &u32::try_from(media.len().div_ceil(CHUNK))
+            .unwrap()
+            .to_le_bytes(),
+    );
+    let checksum = adler32(&table[..16]);
+    table[16..20].copy_from_slice(&checksum.to_le_bytes());
+    table.extend(&entries);
+    let mut footer = [0_u8; 16];
+    footer[..4].copy_from_slice(&adler32(&entries).to_le_bytes());
+    table.extend(footer);
+    section(&mut bytes, 0x04, &table, &mut previous);
+    section(&mut bytes, 0x0f, &[], &mut previous);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("built.Ex01");
+    std::fs::write(&path, bytes).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn media_size_taken_from_damaged_tables_is_reported() {
+    let data = media(3);
+    // No total sector count in the device information.
+    let (_dir, path) = build_ex01(&data, "1\nmain\nbp\tsb\n512\t64\n\n");
+    assert_eq!(Image::open(&path).unwrap().media_size(), data.len() as u64);
+    let table = ewf2_section(&sections(&path), 0x04);
+    // One complete entry remains.
+    truncate(&path, table.data_offset + 32 + 16 + 5);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(image.media_size(), CHUNK as u64);
+    let size = image
+        .lenient_findings()
+        .into_iter()
+        .find(|finding| finding.message.contains("media may be larger"))
+        .unwrap();
+    assert_eq!(size.kind, IntegrityFindingKind::ChunksUnavailable);
+    assert_eq!(readable_chunks(&image, &data[..CHUNK]), 1);
+}
+
+#[test]
+fn media_size_recorded_in_the_metadata_survives_a_lost_table() {
+    let data = media(3);
+    let (_dir, path) = build_ex01(&data, "1\nmain\nbp\tsb\tts\n512\t64\t192\n\n");
+    let table = ewf2_section(&sections(&path), 0x04);
+    truncate(&path, table.data_offset + 32 + 16 + 5);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(image.media_size(), data.len() as u64);
+    assert_eq!(readable_chunks(&image, &data), 1);
+}

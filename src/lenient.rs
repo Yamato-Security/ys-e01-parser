@@ -110,6 +110,11 @@ impl Leniency {
         }
     }
 
+    /// True when any defect has been recorded.
+    pub(crate) fn has_defects(&self) -> bool {
+        !self.defects.is_empty()
+    }
+
     pub(crate) fn into_defects(self) -> Vec<Defect> {
         self.defects
     }

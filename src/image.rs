@@ -871,6 +871,7 @@ impl Image {
             logical_size = chunk_size
                 .checked_mul(discovered_table_chunks)
                 .ok_or_else(|| EwfError::Malformed("logical size overflow".into()))?;
+            record_media_size_from_tables(&mut leniency, discovered_table_chunks);
         }
         if discovered_table_chunks > 0 {
             // Missing tables leave fewer discovered chunks than the media holds.
@@ -3270,6 +3271,23 @@ fn check_unverified_ewf1_geometry(
     }
 }
 
+/// Reports a media size that had to be taken from the chunk tables of a
+/// damaged image: tables that could not be read may have held more media.
+fn record_media_size_from_tables(leniency: &mut Leniency, table_chunks: u64) {
+    if leniency.has_defects() {
+        leniency.record(
+            DefectKind::ChunksUnavailable,
+            None,
+            None,
+            format!(
+                "the media size is not recorded in the image's metadata, so it was taken from \
+                 the chunk tables that could be read ({table_chunks} chunks); the media may be \
+                 larger"
+            ),
+        );
+    }
+}
+
 /// An EWF1 segment parsed after a segment whose chunk count is unknown. Its
 /// ranges are numbered from zero until its position is known.
 struct UnplacedEwf1Segment {
@@ -4328,6 +4346,7 @@ fn parse_ewf2_segment(
         logical_size = chunk_size
             .checked_mul(discovered_chunks)
             .ok_or_else(|| EwfError::Malformed("EWF2 logical size overflow".into()))?;
+        record_media_size_from_tables(leniency, discovered_chunks);
     }
     let table_chunk_count = ranges.iter().try_fold(0_u64, |count, range| {
         count
