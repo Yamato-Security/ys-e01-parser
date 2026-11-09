@@ -1,5 +1,5 @@
 [package]
-name = "ewf-image-fuzz"
+name = "ys-e01-parser-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,8 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ewf-image = { path = "..", features = ["fuzzing"] }
-aff4-image = { path = "../crates/aff4-image" }
+ys-e01-parser = { path = "..", features = ["fuzzing", "writer"] }
 tempfile = "3"
 
 [workspace]
@@ -19,13 +18,6 @@ members = ["."]
 [[bin]]
 name = "ewf_read"
 path = "fuzz_targets/ewf_read.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "aff4_read"
-path = "fuzz_targets/aff4_read.rs"
 test = false
 doc = false
 bench = false
