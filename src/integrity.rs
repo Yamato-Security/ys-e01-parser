@@ -62,10 +62,11 @@ pub enum IntegrityFindingKind {
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.
     MetadataUnavailable,
-    /// Chunk table entries failed their checksum and no intact copy exists.
-    /// Each chunk is returned only when its own checksum (zlib Adler-32 or the
-    /// raw chunk checksum) verifies it and its entry is consistent with the
-    /// others; other chunks of the table fail when read.
+    /// Chunk table entries failed their checksum and no intact copy exists, or
+    /// the table was lost and the chunks were located by decoding them in
+    /// order. Each such chunk is returned only when its own checksum (zlib
+    /// Adler-32 or the raw chunk checksum) verifies it and its location is
+    /// consistent with the other chunks; other chunks fail when read.
     UnverifiedChunkTable,
     /// Chunks with no usable chunk table, because the table is missing from a
     /// damaged segment or the segment's position in the media is unknown.
@@ -368,7 +369,9 @@ impl Image {
         let limit = options.maximum_findings();
         let mut report = IntegrityReport::new();
         report.bytes_total = Some(self.media_size());
-        for item in self.lenient_findings() {
+        let lenient_findings = self.lenient_findings();
+        let reported_lenient_findings = lenient_findings.len();
+        for item in lenient_findings {
             report.push(item, limit);
         }
         if !self.info().acquisition_complete {
@@ -425,6 +428,14 @@ impl Image {
             report.push(item, limit);
             Ok(())
         })?;
+        // Reading every chunk can find more, such as an overlong final chunk.
+        for item in self
+            .lenient_findings()
+            .into_iter()
+            .skip(reported_lenient_findings)
+        {
+            report.push(item, limit);
+        }
         report.bytes_verified = scan.progress.bytes_verified;
         report.media_status = if scan.hashes.is_some() {
             MediaScanStatus::Complete

@@ -339,6 +339,18 @@ fn overlong_final_chunk_keeps_the_media_bytes() {
         md5::Md5::digest(&expected).into()
     };
     assert_eq!(image.verify().unwrap().computed_md5, Some(md5));
+
+    // An analysis that reads the chunk first reports it too.
+    let image = Image::open(&path).unwrap();
+    let report = image.analyze(&VerifyOptions::default()).unwrap();
+    assert_eq!(report.media_status, ewf_image::MediaScanStatus::Complete);
+    assert_eq!(report.warning_count, 2);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::OverlongChunk)
+    );
 }
 
 fn truncate(path: &Path, length: u64) {
