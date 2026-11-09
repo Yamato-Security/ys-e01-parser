@@ -15,8 +15,8 @@ use md5::Digest as _;
 
 use crate::codepage::decode_header_bytes;
 use crate::decode::{
-    ChunkEncoding, decode_chunk_with_decoded_length, raw_chunk_size_cap, validate_encoded_size,
-    zlib_compressed_chunk_size_cap,
+    ChunkEncoding, decode_chunk_with_decoded_length, decode_zlib_exact, raw_chunk_size_cap,
+    validate_encoded_size, zlib_compressed_chunk_size_cap,
 };
 use crate::encryption::EncryptionContext;
 use crate::format::{ewf1, ewf2};
@@ -103,6 +103,8 @@ struct ImageInner {
     defects: Vec<Defect>,
     #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     read_defects: Mutex<Vec<Defect>>,
+    /// Chunks of unverified EWF2 tables whose entries are inconsistent, sorted.
+    rejected_chunks: Vec<u64>,
     read_zero_chunk_on_error: AtomicBool,
     abort_signaled: AtomicBool,
 }
@@ -244,6 +246,10 @@ struct Chunk {
     logical_size: usize,
     encoding: ChunkEncoding,
     validate_checksum: bool,
+    /// The table entry is unverified: the chunk is returned only if its own
+    /// checksum verifies it (a zlib stream filling the stored bytes exactly, or
+    /// a raw chunk's trailing checksum).
+    self_verify: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -600,6 +606,8 @@ impl Image {
         // Set while the first segment's media geometry comes from a damaged
         // section that no intact copy has confirmed yet.
         let mut ewf1_geometry_unverified: Option<String> = None;
+        let mut ewf2_next_chunk = 0_u64;
+        let mut rejected_chunks = Vec::new();
         let mut expected_set_identifier: Option<[u8; 16]> = None;
         let mut expected_ewf1_media = None;
         let mut expected_ewf1_compression_method = None;
@@ -635,6 +643,7 @@ impl Image {
                             0
                         },
                         inherited_media_geometry: expected_ewf1_media,
+                        ewf2_expected_first_chunk: ewf2_next_chunk,
                     },
                     &mut leniency,
                     options.header_codepage(),
@@ -759,6 +768,13 @@ impl Image {
                 acquisition_complete = parsed.acquisition_complete;
             }
             merge_hashes(&mut stored_hashes, &parsed.stored_hashes)?;
+            rejected_chunks.extend(parsed.rejected_chunks);
+            if parsed.format == Format::Ewf2 {
+                for range in &parsed.ranges {
+                    ewf2_next_chunk =
+                        ewf2_next_chunk.max(range.first_chunk.saturating_add(range.chunk_count));
+                }
+            }
             if parsed.format == Format::Ewf1 && !ewf1_positions_known {
                 unplaced_ewf1.push(UnplacedEwf1Segment {
                     segment_index,
@@ -935,6 +951,11 @@ impl Image {
                 checksum_errors: Mutex::new(Vec::new()),
                 defects: leniency.into_defects(),
                 read_defects: Mutex::new(Vec::new()),
+                rejected_chunks: {
+                    rejected_chunks.sort_unstable();
+                    rejected_chunks.dedup();
+                    rejected_chunks
+                },
                 read_zero_chunk_on_error: AtomicBool::new(options.read_zero_chunk_on_error()),
                 abort_signaled: AtomicBool::new(false),
             }),
@@ -1826,6 +1847,11 @@ impl Image {
     pub fn read_encoded_data_chunk(&self, chunk_index: u64) -> Result<EncodedDataChunk> {
         self.ensure_not_aborted()?;
         let chunk = self.lookup_chunk(chunk_index)?;
+        if chunk.self_verify {
+            // Stored bytes behind an unverified table entry are returned only
+            // once they verify as this chunk.
+            self.decode_chunk(chunk_index, chunk)?;
+        }
         let data = self.read_encoded_chunk_bytes(chunk_index, chunk)?;
         let logical_offset = chunk_index
             .checked_mul(self.inner.info.chunk_size)
@@ -1986,6 +2012,15 @@ impl Image {
                 "EWF1 chunk offsets are not ordered".into(),
             ));
         }
+        let self_verify = !range.entries_verified;
+        if self_verify
+            && (range.data_start.is_some_and(|start| entry.offset < start)
+                || range.data_end.is_some_and(|end| next_offset > end))
+        {
+            return Err(EwfError::Malformed(
+                "unverified EWF1 table entry points outside the chunk data".into(),
+            ));
+        }
         let encoded_size = next_offset - entry.offset;
         let compression_method = range.ewf1_compression_method.ok_or_else(|| {
             EwfError::Malformed("EWF1 table range has no compression method".into())
@@ -2013,6 +2048,7 @@ impl Image {
                     .ok()
                     .and_then(|size| size.checked_add(4))
                     == Some(encoded_size),
+            self_verify,
         })
     }
 
@@ -2048,6 +2084,14 @@ impl Image {
         };
         let validate_checksum = matches!(encoding, ChunkEncoding::Raw)
             && entry.flags & ewf2::CHUNK_FLAG_HAS_CHECKSUM != 0;
+        let self_verify = !range.entries_verified;
+        let chunk_id = range.first_chunk.saturating_add(local_index);
+        if self_verify && self.inner.rejected_chunks.binary_search(&chunk_id).is_ok() {
+            return Err(EwfError::Malformed(format!(
+                "unverified EWF2 table entry of chunk {chunk_id} overlaps another entry or \
+                 points outside the sector data"
+            )));
+        }
         validate_encoded_size(
             u64::from(entry.chunk_data_size),
             self.inner.info.chunk_size,
@@ -2060,6 +2104,7 @@ impl Image {
             logical_size,
             encoding,
             validate_checksum,
+            self_verify,
         })
     }
 
@@ -2271,6 +2316,14 @@ impl Image {
     }
 
     fn decode_chunk(&self, chunk_id: u64, chunk: Chunk) -> Result<Vec<u8>> {
+        if chunk.self_verify
+            && !matches!(chunk.encoding, ChunkEncoding::Zlib)
+            && !(chunk.encoding == ChunkEncoding::Raw && chunk.validate_checksum)
+        {
+            return Err(EwfError::Malformed(format!(
+                "chunk {chunk_id} has an unverified table entry and no checksum of its own"
+            )));
+        }
         let encoded = self.read_encoded_chunk_bytes(chunk_id, chunk)?;
         if chunk.validate_checksum {
             validate_raw_chunk_checksum(&encoded, chunk.logical_size)?;
@@ -2294,18 +2347,26 @@ impl Image {
         // a few bytes past the media end in it; lenient reading keeps the media's
         // bytes, as libewf does, and records the condition.
         let lenient_final_chunk = self.inner.open_strictness == OpenStrictness::Lenient
-            && chunk.logical_size < full_chunk_size;
+            && chunk.logical_size < full_chunk_size
+            && !chunk.self_verify;
         let maximum_decoded_size = if padded_logical_profile || lenient_final_chunk {
             full_chunk_size.max(chunk.logical_size)
         } else {
             chunk.logical_size
         };
-        let (decoded, decoded_length) = decode_chunk_with_decoded_length(
-            &encoded,
-            chunk.encoding,
-            chunk.logical_size,
-            maximum_decoded_size,
-        )?;
+        let (decoded, decoded_length) = if chunk.self_verify
+            && chunk.encoding == ChunkEncoding::Zlib
+        {
+            let decoded = decode_zlib_exact(&encoded, chunk.logical_size, maximum_decoded_size)?;
+            (decoded, chunk.logical_size)
+        } else {
+            decode_chunk_with_decoded_length(
+                &encoded,
+                chunk.encoding,
+                chunk.logical_size,
+                maximum_decoded_size,
+            )?
+        };
         if !padded_logical_profile && decoded_length > chunk.logical_size {
             self.record_read_defect(Defect {
                 kind: DefectKind::OverlongChunk,
@@ -2932,6 +2993,8 @@ struct ParsedSegment {
     /// damaged copy tentatively; it must then agree with the rest of the image.
     /// `None` when it came from an intact section (or there was none).
     ewf1_geometry_unverified: Option<String>,
+    /// EWF2: chunks of unverified tables whose entries are inconsistent.
+    rejected_chunks: Vec<u64>,
     metadata: EwfMetadata,
     stored_hashes: StoredHashes,
     acquisition_errors: Vec<AcquisitionError>,
@@ -2969,6 +3032,8 @@ struct Ewf1MediaGeometry {
 struct Ewf1SegmentContext {
     first_chunk: u64,
     inherited_media_geometry: Option<Ewf1MediaGeometry>,
+    /// EWF2: the end of the previous segments' tables.
+    ewf2_expected_first_chunk: u64,
 }
 
 /// Accepts media geometry read from a damaged section only when the image
@@ -3102,6 +3167,7 @@ fn parse_ewf1_segment(
     let Ewf1SegmentContext {
         first_chunk,
         inherited_media_geometry,
+        ..
     } = context;
 
     let chain = scan_ewf1_sections(file, segment_index, leniency)?;
@@ -3252,19 +3318,25 @@ fn parse_ewf1_segment(
         }
     }
 
-    let ranges = parse_ewf1_ranges(
+    let Ewf1Ranges {
+        ranges,
+        complete: ranges_complete,
+    } = parse_ewf1_ranges(
         file,
         &sections,
-        segment_index,
-        first_chunk,
-        // A segment cut short may have lost its tables; the gap is reported once
-        // the whole image is indexed.
-        if chain_complete { logical_size } else { 0 },
+        Ewf1RangeContext {
+            segment_index,
+            first_chunk,
+            // A segment cut short may have lost its tables; the gap is reported
+            // once the whole image is indexed.
+            logical_size: if chain_complete { logical_size } else { 0 },
+        },
         Ewf1RangeProfile {
             allow_large_compressed_chunks: volume.as_ref().is_some_and(|volume| volume.smart),
             compression_method,
             lenient: leniency.is_lenient(),
         },
+        leniency,
         statistics,
     )?;
     let table_chunk_count = ranges.iter().try_fold(0_u64, |count, range| {
@@ -3299,8 +3371,9 @@ fn parse_ewf1_segment(
         media,
         ranges,
         table_chunk_count,
-        ewf1_chain_complete: chain_complete,
+        ewf1_chain_complete: chain_complete && ranges_complete,
         ewf1_geometry_unverified: unverified_geometry,
+        rejected_chunks: Vec::new(),
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -3693,7 +3766,13 @@ fn parse_segment(
             statistics,
         )
     } else if signature == ewf2::EX01_SIGNATURE || signature == ewf2::LEF2_SIGNATURE {
-        parse_ewf2_segment(file, segment_index, leniency, statistics)
+        parse_ewf2_segment(
+            file,
+            segment_index,
+            ewf1_context.ewf2_expected_first_chunk,
+            leniency,
+            statistics,
+        )
     } else {
         Err(EwfError::InvalidSignature)
     }
@@ -3702,6 +3781,7 @@ fn parse_segment(
 fn parse_ewf2_segment(
     file: &mut dyn SegmentReader,
     segment_index: usize,
+    expected_first_chunk: u64,
     leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<ParsedSegment> {
@@ -3961,12 +4041,19 @@ fn parse_ewf2_segment(
         chunk_size = 32_768;
     }
     validate_chunk_size(chunk_size)?;
-    let ranges = parse_ewf2_ranges(
+    let Ewf2Ranges {
+        ranges,
+        rejected_chunks,
+    } = parse_ewf2_ranges(
         file,
         &sections,
-        segment_index,
-        logical_size,
-        header.compression_method,
+        Ewf2RangeContext {
+            segment_index,
+            logical_size,
+            expected_first_chunk,
+            compression_method: header.compression_method,
+        },
+        leniency,
         statistics,
     )?;
     if logical_size == 0 {
@@ -4029,6 +4116,7 @@ fn parse_ewf2_segment(
         table_chunk_count,
         ewf1_chain_complete: true,
         ewf1_geometry_unverified: None,
+        rejected_chunks,
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -4651,42 +4739,36 @@ fn parse_ewf2_single_files_aux_table<T>(
         .collect())
 }
 
-fn parse_ewf1_ranges(
-    file: &mut dyn SegmentReader,
-    sections: &[Section],
+/// A segment's EWF1 table ranges.
+struct Ewf1Ranges {
+    ranges: Vec<TableRange>,
+    /// False when lenient opening could not read a table's chunk count, so the
+    /// segment's later chunks (and the following segments) have no known position.
+    complete: bool,
+}
+
+/// The position of an EWF1 segment's tables in the media.
+#[derive(Clone, Copy)]
+struct Ewf1RangeContext {
     segment_index: usize,
     first_chunk: u64,
     logical_size: u64,
-    profile: Ewf1RangeProfile,
-    statistics: &ReaderStatisticsCollector,
-) -> Result<Vec<TableRange>> {
-    let mut ranges = Vec::new();
-    let mut next_chunk = first_chunk;
-    let mut previous_table: Option<(bool, u32, u64)> = None;
-    for section in sections
-        .iter()
-        .filter(|section| matches!(section.desc.section_type.as_str(), "table" | "table2"))
-    {
-        if section.data_size < 24 {
-            return Err(EwfError::Malformed(
-                "EWF1 table section is too short".into(),
-            ));
-        }
-        let data = read_exact_at(file, section.data_offset, 24)?;
-        validate_present_adler32_checksum(&data, 20, 20, "EWF1 table header")?;
-        let entry_count = u32::from_le_bytes(data[0..4].try_into().expect("slice length checked"));
-        let base_offset = u64::from_le_bytes(data[8..16].try_into().expect("slice length checked"));
-        if entry_count == 0 {
-            continue;
-        }
-        if section.desc.section_type == "table2"
-            && previous_table.is_some_and(|(previous_was_table, previous_count, previous_base)| {
-                previous_was_table && previous_count == entry_count && previous_base == base_offset
-            })
-        {
-            continue;
-        }
+}
 
+/// The parts of an EWF1 table section header and its entry area.
+#[derive(Clone, Copy)]
+struct Ewf1TableLayout {
+    entry_count: u32,
+    base_offset: u64,
+    entries_offset: u64,
+    entries_end: u64,
+    section_end: u64,
+}
+
+impl Ewf1TableLayout {
+    fn new(section: &Section, header: &[u8]) -> Result<Self> {
+        let entry_count = u32::from_le_bytes(read_array(header, 0)?);
+        let base_offset = u64::from_le_bytes(read_array(header, 8)?);
         let entry_bytes = u64::from(entry_count)
             .checked_mul(4)
             .ok_or_else(|| EwfError::Malformed("EWF1 table entry bytes overflow".into()))?;
@@ -4701,74 +4783,303 @@ fn parse_ewf1_ranges(
             .data_offset
             .checked_add(section.data_size)
             .ok_or_else(|| EwfError::Malformed("EWF1 table section range overflow".into()))?;
-        if entries_end > section_end {
-            return Err(EwfError::Malformed(
-                "EWF1 table entries exceed section".into(),
-            ));
+        Ok(Self {
+            entry_count,
+            base_offset,
+            entries_offset,
+            entries_end,
+            section_end,
+        })
+    }
+
+    fn entry_bytes(&self) -> u64 {
+        self.entries_end - self.entries_offset
+    }
+
+    fn has_footer(&self) -> bool {
+        self.entries_end
+            .checked_add(4)
+            .is_some_and(|footer_end| footer_end <= self.section_end)
+    }
+}
+
+/// Copies `N` bytes at `offset` out of `data`, failing instead of panicking.
+fn read_array<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
+    offset
+        .checked_add(N)
+        .and_then(|end| data.get(offset..end))
+        .and_then(|bytes| <[u8; N]>::try_from(bytes).ok())
+        .ok_or_else(|| EwfError::BufferTooShort {
+            needed: offset.saturating_add(N),
+            actual: data.len(),
+        })
+}
+
+/// Reads an EWF1 table header; `Ok(None)` when the section is too short.
+fn read_ewf1_table_header(
+    file: &mut dyn SegmentReader,
+    section: &Section,
+) -> Result<Option<Vec<u8>>> {
+    if section.data_size < 24 {
+        return Ok(None);
+    }
+    read_exact_at(file, section.data_offset, 24).map(Some)
+}
+
+/// The `table2` following `table`, when it is an intact copy of a table whose
+/// own header is damaged: its header checksum matches and its entries are the
+/// same bytes as the damaged table's.
+fn intact_mirror_of_damaged_table(
+    file: &mut dyn SegmentReader,
+    table: &Section,
+    mirror: &Section,
+) -> Result<Option<Ewf1TableLayout>> {
+    let Some(header) = read_ewf1_table_header(file, mirror)? else {
+        return Ok(None);
+    };
+    if validate_present_adler32_checksum(&header, 20, 20, "EWF1 table header").is_err()
+        || mirror.data_size != table.data_size
+    {
+        return Ok(None);
+    }
+    let layout = Ewf1TableLayout::new(mirror, &header)?;
+    if layout.entries_end > layout.section_end {
+        return Ok(None);
+    }
+    let size = layout.entry_bytes();
+    let own = read_exact_at(file, table.data_offset.saturating_add(24), size)?;
+    let copy = read_exact_at(file, layout.entries_offset, size)?;
+    Ok((own == copy).then_some(layout))
+}
+
+/// The `table2` following `table`, when it repeats the table's header and its
+/// entries checksum matches.
+fn intact_mirror_entries(
+    file: &mut dyn SegmentReader,
+    table: &Ewf1TableLayout,
+    mirror: &Section,
+    statistics: &ReaderStatisticsCollector,
+) -> Result<Option<Ewf1TableLayout>> {
+    let Some(header) = read_ewf1_table_header(file, mirror)? else {
+        return Ok(None);
+    };
+    if validate_present_adler32_checksum(&header, 20, 20, "EWF1 table header").is_err() {
+        return Ok(None);
+    }
+    let layout = Ewf1TableLayout::new(mirror, &header)?;
+    if layout.entry_count != table.entry_count
+        || layout.base_offset != table.base_offset
+        || layout.entries_end > layout.section_end
+        || !layout.has_footer()
+    {
+        return Ok(None);
+    }
+    Ok(validate_present_table_entries_checksum(
+        file,
+        layout.entries_offset,
+        layout.entry_bytes(),
+        layout.entries_end,
+        "EWF1 table2 entries",
+        statistics,
+    )
+    .is_ok()
+    .then_some(layout))
+}
+
+fn parse_ewf1_ranges(
+    file: &mut dyn SegmentReader,
+    sections: &[Section],
+    context: Ewf1RangeContext,
+    profile: Ewf1RangeProfile,
+    leniency: &mut Leniency,
+    statistics: &ReaderStatisticsCollector,
+) -> Result<Ewf1Ranges> {
+    const LATER_CHUNKS_UNKNOWN: &str = "the chunk count of this table is unknown, so the segment's later chunks cannot be \
+         placed";
+    let Ewf1RangeContext {
+        segment_index,
+        first_chunk,
+        logical_size,
+    } = context;
+    let tables: Vec<&Section> = sections
+        .iter()
+        .filter(|section| matches!(section.desc.section_type.as_str(), "table" | "table2"))
+        .collect();
+    let mirror_after = |index: usize| {
+        tables
+            .get(index + 1)
+            .copied()
+            .filter(|mirror| mirror.desc.section_type == "table2")
+    };
+    let mut ranges = Vec::new();
+    let mut complete = true;
+    let mut next_chunk = first_chunk;
+    let mut previous_table: Option<(bool, u32, u64)> = None;
+    let mut index = 0;
+    while let Some(&section) = tables.get(index) {
+        let is_table = section.desc.section_type == "table";
+        let mut mirror = if is_table { mirror_after(index) } else { None };
+        index += 1;
+        let Some(header) = read_ewf1_table_header(file, section)? else {
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 table section is too short".into()),
+                DefectKind::ChunksUnavailable,
+                segment_index,
+                section.desc.offset,
+                LATER_CHUNKS_UNKNOWN,
+            )?;
+            complete = false;
+            break;
+        };
+        // Where the entries are read from: the table, or an intact table2 copy.
+        let mut layout =
+            match validate_present_adler32_checksum(&header, 20, 20, "EWF1 table header") {
+                Ok(()) => Ewf1TableLayout::new(section, &header)?,
+                Err(error) => {
+                    let replacement = match mirror {
+                        Some(mirror) if leniency.is_lenient() => {
+                            intact_mirror_of_damaged_table(file, section, mirror)?
+                        }
+                        _ => None,
+                    };
+                    let Some(replacement) = replacement else {
+                        leniency.tolerate(
+                            error,
+                            DefectKind::ChunksUnavailable,
+                            segment_index,
+                            section.desc.offset,
+                            LATER_CHUNKS_UNKNOWN,
+                        )?;
+                        complete = false;
+                        break;
+                    };
+                    leniency.tolerate(
+                        error,
+                        DefectKind::ChecksumMismatch,
+                        segment_index,
+                        section.desc.offset,
+                        "the following table2 section holds the same entries, so its intact header \
+                     was used",
+                    )?;
+                    index += 1;
+                    // Its entries are the ones now in use; there is no further copy.
+                    mirror = None;
+                    replacement
+                }
+            };
+        let entry_count = layout.entry_count;
+        let base_offset = layout.base_offset;
+        if entry_count == 0 {
+            continue;
+        }
+        if section.desc.section_type == "table2"
+            && previous_table.is_some_and(|(previous_was_table, previous_count, previous_base)| {
+                previous_was_table && previous_count == entry_count && previous_base == base_offset
+            })
+        {
+            continue;
+        }
+
+        if layout.entries_end > layout.section_end {
+            leniency.tolerate(
+                EwfError::Malformed("EWF1 table entries exceed section".into()),
+                DefectKind::ChunksUnavailable,
+                segment_index,
+                section.desc.offset,
+                LATER_CHUNKS_UNKNOWN,
+            )?;
+            complete = false;
+            break;
         }
         let first_entry_offset = if base_offset == 0 {
-            let raw = read_exact_at(file, entries_offset, 4)?;
+            let raw = read_exact_at(file, layout.entries_offset, 4)?;
             Some(u64::from(
-                u32::from_le_bytes(raw.try_into().expect("first table entry read size checked"))
-                    & 0x7fff_ffff,
+                u32::from_le_bytes(read_array(&raw, 0)?) & 0x7fff_ffff,
             ))
         } else {
             None
         };
         let table_resident_without_entries_checksum =
-            first_entry_offset.is_some_and(|offset| offset == entries_end);
-        if entries_end
-            .checked_add(4)
-            .is_some_and(|footer_end| footer_end <= section_end)
+            first_entry_offset.is_some_and(|offset| offset == layout.entries_end);
+        let sectors = matching_sectors_section(sections, base_offset)
+            .or_else(|| {
+                first_entry_offset
+                    .and_then(|offset| sectors_section_containing_offset(sections, offset))
+            })
+            .or_else(|| {
+                // A sectors descriptor whose damaged type name was repaired from its
+                // offsets keeps its position: the table's base names it.
+                (profile.lenient && base_offset != 0)
+                    .then(|| {
+                        sections.iter().find(|section| {
+                            section.desc.offset == base_offset
+                                || sectors_section_contains_offset(section, base_offset)
+                        })
+                    })
+                    .flatten()
+            });
+        let mut entries_verified = true;
+        if layout.has_footer()
             && !table_resident_without_entries_checksum
-        {
-            validate_present_table_entries_checksum(
+            && let Err(error) = validate_present_table_entries_checksum(
                 file,
-                entries_offset,
-                entry_bytes,
-                entries_end,
+                layout.entries_offset,
+                layout.entry_bytes(),
+                layout.entries_end,
                 "EWF1 table entries",
                 statistics,
-            )?;
+            )
+        {
+            // Chunks stored inside the table section itself have no copy.
+            let copy = match mirror {
+                Some(mirror) if leniency.is_lenient() && sectors.is_some() => {
+                    intact_mirror_entries(file, &layout, mirror, statistics)?
+                }
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                leniency.tolerate(
+                    error,
+                    DefectKind::ChecksumMismatch,
+                    segment_index,
+                    section.desc.offset,
+                    "the intact entries of the following table2 section were used",
+                )?;
+                layout = copy;
+                index += 1;
+            } else {
+                leniency.tolerate(
+                    error,
+                    DefectKind::UnverifiedChunkTable,
+                    segment_index,
+                    section.desc.offset,
+                    "no intact copy exists, so each of its chunks is returned only when the \
+                     chunk's own checksum verifies it",
+                )?;
+                entries_verified = false;
+            }
         }
 
-        let (data_base, data_end) = if let Some(sectors) =
-            matching_sectors_section(sections, base_offset)
-                .or_else(|| {
-                    first_entry_offset
-                        .and_then(|offset| sectors_section_containing_offset(sections, offset))
-                })
-                .or_else(|| {
-                    // A sectors descriptor whose damaged type name was repaired from
-                    // its offsets keeps its position: the table's base names it.
-                    (profile.lenient && base_offset != 0)
-                        .then(|| {
-                            sections.iter().find(|section| {
-                                section.desc.offset == base_offset
-                                    || sectors_section_contains_offset(section, base_offset)
-                            })
-                        })
-                        .flatten()
-                }) {
+        let (data_base, data_start, data_end) = if let Some(sectors) = sectors {
             let data_end = sectors
                 .data_offset
                 .checked_add(sectors.data_size)
                 .ok_or_else(|| EwfError::Malformed("EWF1 sectors range overflow".into()))?;
-            (base_offset, data_end)
+            (base_offset, sectors.data_offset, data_end)
         } else {
             let resident_data_start = if table_resident_without_entries_checksum {
-                entries_end
+                layout.entries_end
             } else {
-                entries_end.checked_add(4).ok_or_else(|| {
+                layout.entries_end.checked_add(4).ok_or_else(|| {
                     EwfError::Malformed("EWF1 table-resident data offset overflow".into())
                 })?
             };
-            if resident_data_start > section_end {
+            if resident_data_start > layout.section_end {
                 return Err(EwfError::Malformed(
                     "EWF1 table-resident data starts beyond table section".into(),
                 ));
             }
-            (0, section_end)
+            (0, resident_data_start, layout.section_end)
         };
 
         ranges.push(TableRange {
@@ -4776,27 +5087,25 @@ fn parse_ewf1_ranges(
             segment_index,
             first_chunk: next_chunk,
             chunk_count: u64::from(entry_count),
-            entries_offset,
+            entries_offset: layout.entries_offset,
             base_offset: data_base,
             data_end: Some(data_end),
             ewf1_allow_large_compressed_chunks: profile.allow_large_compressed_chunks,
             ewf1_compression_method: Some(profile.compression_method),
             ewf2_compression_method: None,
+            entries_verified,
+            data_start: Some(data_start),
         });
         next_chunk = next_chunk
             .checked_add(u64::from(entry_count))
             .ok_or_else(|| EwfError::Malformed("EWF1 table chunk count overflow".into()))?;
-        previous_table = Some((
-            section.desc.section_type == "table",
-            entry_count,
-            base_offset,
-        ));
+        previous_table = Some((is_table, entry_count, base_offset));
     }
 
-    if ranges.is_empty() && logical_size > 0 {
+    if ranges.is_empty() && logical_size > 0 && complete {
         return Err(EwfError::Malformed("EWF1 table coverage is missing".into()));
     }
-    Ok(ranges)
+    Ok(Ewf1Ranges { ranges, complete })
 }
 
 fn matching_sectors_section(sections: &[Section], base_offset: u64) -> Option<&Section> {
@@ -4823,15 +5132,52 @@ fn sectors_section_contains_offset(section: &Section, offset: u64) -> bool {
         .is_some_and(|data_end| offset >= section.data_offset && offset <= data_end)
 }
 
+/// A segment's EWF2 table ranges.
+struct Ewf2Ranges {
+    ranges: Vec<TableRange>,
+    /// Chunks of unverified tables whose entries overlap another entry or point
+    /// outside the segment's sector data; reading them fails.
+    rejected_chunks: Vec<u64>,
+}
+
+/// The position of an EWF2 segment's tables in the media.
+#[derive(Clone, Copy)]
+struct Ewf2RangeContext {
+    segment_index: usize,
+    logical_size: u64,
+    /// Where the first table of this segment must start: the end of the
+    /// previous segments' tables. Checks a table whose header is damaged.
+    expected_first_chunk: u64,
+    compression_method: ewf2::CompressionMethod,
+}
+
 fn parse_ewf2_ranges(
     file: &mut dyn SegmentReader,
     sections: &[Ewf2Section],
-    segment_index: usize,
-    logical_size: u64,
-    compression_method: ewf2::CompressionMethod,
+    context: Ewf2RangeContext,
+    leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
-) -> Result<Vec<TableRange>> {
+) -> Result<Ewf2Ranges> {
+    const NOT_USED: &str = "the table is not used, so its chunks fail when read";
+    let Ewf2RangeContext {
+        segment_index,
+        logical_size,
+        expected_first_chunk,
+        compression_method,
+    } = context;
+    let sector_data: Vec<(u64, u64)> = sections
+        .iter()
+        .filter(|section| section.desc.section_type == ewf2::SectionType::SectorData)
+        .map(|section| {
+            (
+                section.data_offset,
+                section.data_offset.saturating_add(section.data_size),
+            )
+        })
+        .collect();
     let mut ranges = Vec::new();
+    let mut rejected_chunks = Vec::new();
+    let mut expected_next = expected_first_chunk;
     for section in sections
         .iter()
         .filter(|section| section.desc.section_type == ewf2::SectionType::SectorTable)
@@ -4841,7 +5187,14 @@ fn parse_ewf2_ranges(
             Ewf2SectionLayout::TrailingDescriptor => EWF2_TABLE_HEADER_V2_SIZE,
         };
         if section.data_size < minimum_table_header_size {
-            return Err(EwfError::Malformed("EWF2 sector table is too short".into()));
+            leniency.tolerate(
+                EwfError::Malformed("EWF2 sector table is too short".into()),
+                DefectKind::ChunksUnavailable,
+                segment_index,
+                section.desc.offset,
+                NOT_USED,
+            )?;
+            continue;
         }
         let header_read_size = if section.data_size >= EWF2_TABLE_HEADER_V2_SIZE {
             EWF2_TABLE_HEADER_V2_SIZE
@@ -4849,10 +5202,19 @@ fn parse_ewf2_ranges(
             minimum_table_header_size
         };
         let data = read_exact_at(file, section.data_offset, header_read_size)?;
-        validate_present_adler32_checksum(&data, 16, 16, "EWF2 table header")?;
-        let header = ewf2::TableHeader::parse(&data[..ewf2::TABLE_HEADER_SIZE])?;
+        let header_check =
+            match validate_present_adler32_checksum(&data, 16, 16, "EWF2 table header") {
+                Err(error) if !leniency.is_lenient() => return Err(error),
+                checked => checked,
+            };
+        let header = ewf2::TableHeader::parse(data.get(..ewf2::TABLE_HEADER_SIZE).ok_or(
+            EwfError::BufferTooShort {
+                needed: ewf2::TABLE_HEADER_SIZE,
+                actual: data.len(),
+            },
+        )?)?;
         let entry_count = u64::from(header.entry_count);
-        if entry_count == 0 {
+        if entry_count == 0 && header_check.is_ok() {
             continue;
         }
         let entries_bytes = entry_count
@@ -4883,14 +5245,20 @@ fn parse_ewf2_ranges(
             .checked_add(section.data_size)
             .ok_or_else(|| EwfError::Malformed("EWF2 table section range overflow".into()))?;
         if entries_end > section_end {
-            return Err(EwfError::Malformed(
-                "EWF2 table entries exceed section".into(),
-            ));
+            let error = EwfError::Malformed("EWF2 table entries exceed section".into());
+            leniency.tolerate(
+                header_check.err().unwrap_or(error),
+                DefectKind::ChunksUnavailable,
+                segment_index,
+                section.desc.offset,
+                NOT_USED,
+            )?;
+            continue;
         }
-        if entries_end
+        let has_footer = entries_end
             .checked_add(EWF2_TABLE_FOOTER_SIZE)
-            .is_some_and(|footer_end| footer_end <= section_end)
-        {
+            .is_some_and(|footer_end| footer_end <= section_end);
+        let entries_check = if has_footer {
             validate_present_table_entries_checksum(
                 file,
                 entries_offset,
@@ -4898,9 +5266,59 @@ fn parse_ewf2_ranges(
                 entries_end,
                 "EWF2 table entries",
                 statistics,
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(error) = header_check {
+            // A damaged header is used only when the entries checksum, computed
+            // over the entry count it states, matches a stored checksum, and the
+            // table continues exactly where the previous one ended.
+            let stored_entries_checksum = has_footer
+                && read_exact_at(file, entries_end, 4)? != [0; 4]
+                && entries_check.is_ok();
+            if entry_count == 0 || !stored_entries_checksum || header.first_chunk != expected_next {
+                leniency.tolerate(
+                    error,
+                    DefectKind::ChunksUnavailable,
+                    segment_index,
+                    section.desc.offset,
+                    NOT_USED,
+                )?;
+                continue;
+            }
+            leniency.tolerate(
+                error,
+                DefectKind::ChecksumMismatch,
+                segment_index,
+                section.desc.offset,
+                "the entries checksum confirms its chunk count and its first chunk follows \
+                 the previous table, so it was used",
             )?;
         }
+        let entries_verified = match entries_check {
+            Ok(()) => true,
+            Err(error) => {
+                leniency.tolerate(
+                    error,
+                    DefectKind::UnverifiedChunkTable,
+                    segment_index,
+                    section.desc.offset,
+                    "no intact copy exists, so each of its chunks is returned only when the \
+                     chunk's own checksum verifies it and its entry does not overlap another",
+                )?;
+                rejected_chunks.extend(inconsistent_ewf2_entries(
+                    file,
+                    entries_offset,
+                    entries_bytes,
+                    header.first_chunk,
+                    &sector_data,
+                )?);
+                false
+            }
+        };
 
+        expected_next = header.first_chunk.saturating_add(entry_count);
         ranges.push(TableRange {
             kind: TableRangeKind::Ewf2,
             segment_index,
@@ -4912,13 +5330,75 @@ fn parse_ewf2_ranges(
             ewf1_allow_large_compressed_chunks: false,
             ewf1_compression_method: None,
             ewf2_compression_method: Some(compression_method_code(compression_method)),
+            entries_verified,
+            data_start: None,
         });
     }
 
-    if ranges.is_empty() && logical_size > 0 {
+    if ranges.is_empty() && logical_size > 0 && !leniency.is_lenient() {
         return Err(EwfError::Malformed("EWF2 image has no sector table".into()));
     }
-    Ok(ranges)
+    Ok(Ewf2Ranges {
+        ranges,
+        rejected_chunks,
+    })
+}
+
+/// Chunks of an unverified EWF2 table whose data entries cannot be trusted
+/// even if the data verifies itself: entries outside the segment's sector data,
+/// entries that start where another entry starts (a damaged offset that points
+/// at another chunk), and entries whose data runs into the next entry's.
+/// Pattern-fill entries carry no data to verify and fail when read.
+fn inconsistent_ewf2_entries(
+    file: &mut dyn SegmentReader,
+    entries_offset: u64,
+    entries_bytes: u64,
+    first_chunk: u64,
+    sector_data: &[(u64, u64)],
+) -> Result<Vec<u64>> {
+    let entries = read_exact_at(file, entries_offset, entries_bytes)?;
+    let mut extents = Vec::new();
+    let mut rejected = Vec::new();
+    for (index, entry) in (0_u64..).zip(entries.as_chunks::<{ ewf2::TABLE_ENTRY_SIZE }>().0) {
+        let entry = ewf2::TableEntry::parse(entry, ewf2::CompressionMethod::Zlib)?;
+        if entry.kind == ewf2::ChunkKind::PatternFill {
+            continue;
+        }
+        let start = entry.chunk_data_offset;
+        let end = start.checked_add(u64::from(entry.chunk_data_size));
+        let inside = end.is_some_and(|end| {
+            entry.chunk_data_size > 0
+                && sector_data
+                    .iter()
+                    .any(|(data_start, data_end)| start >= *data_start && end <= *data_end)
+        });
+        if inside {
+            extents.push((start, end.unwrap_or(start), index));
+        } else {
+            rejected.push(first_chunk.saturating_add(index));
+        }
+    }
+    extents.sort_unstable();
+    for pair in extents.windows(2) {
+        if let [
+            (previous_start, previous_end, previous),
+            (start, _, current),
+        ] = pair
+        {
+            if start == previous_start {
+                // A damaged offset that names another chunk's start would read
+                // that chunk, which verifies itself: neither entry can be trusted.
+                rejected.push(first_chunk.saturating_add(*previous));
+                rejected.push(first_chunk.saturating_add(*current));
+            } else if start < previous_end {
+                // A data size that runs into the next chunk is damaged.
+                rejected.push(first_chunk.saturating_add(*previous));
+            }
+        }
+    }
+    rejected.sort_unstable();
+    rejected.dedup();
+    Ok(rejected)
 }
 
 fn read_exact_at(file: &mut dyn SegmentReader, offset: u64, size: u64) -> Result<Vec<u8>> {

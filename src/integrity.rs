@@ -60,6 +60,11 @@ pub enum IntegrityFindingKind {
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.
     MetadataUnavailable,
+    /// Chunk table entries failed their checksum and no intact copy exists.
+    /// Each chunk is returned only when its own checksum (zlib Adler-32 or the
+    /// raw chunk checksum) verifies it and its entry is consistent with the
+    /// others; other chunks of the table fail when read.
+    UnverifiedChunkTable,
     /// Chunks with no usable chunk table, because the table is missing from a
     /// damaged segment or the segment's position in the media is unknown.
     /// Reading them fails.
@@ -174,6 +179,10 @@ fn defect_finding(defect: &Defect, chunk_size: u64) -> IntegrityFinding {
         ),
         DefectKind::ChecksumMismatch => (
             IntegrityFindingKind::StructureChecksumMismatch,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::UnverifiedChunkTable => (
+            IntegrityFindingKind::UnverifiedChunkTable,
             IntegritySeverity::Error,
         ),
         DefectKind::ChunksUnavailable => (

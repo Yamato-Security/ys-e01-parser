@@ -4868,7 +4868,7 @@ fn image_signal_abort_stops_subsequent_reads() {
 fn image_open_rejects_ewf1_table_bad_header_checksum() {
     let file = writer_e01_with_bad_table_header_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -4880,7 +4880,7 @@ fn image_open_rejects_ewf1_table_bad_header_checksum() {
 fn image_open_rejects_ewf1_table_bad_entries_checksum() {
     let file = writer_e01_with_bad_table_entries_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6467,7 +6467,7 @@ fn image_read_zeroes_ewf2_raw_chunk_bad_checksum_when_requested() {
 fn image_open_rejects_ewf2_table_bad_header_checksum() {
     let file = writer_ex01_with_bad_table_header_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6479,7 +6479,7 @@ fn image_open_rejects_ewf2_table_bad_header_checksum() {
 fn image_open_rejects_ewf2_table_bad_entries_checksum() {
     let file = writer_ex01_with_bad_table_entries_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,

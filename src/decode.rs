@@ -2,6 +2,7 @@ use std::io::Read;
 
 use bzip2::read::BzDecoder;
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use ruzstd::decoding::StreamingDecoder as ZstdDecoder;
 
 use crate::{EwfError, Result};
@@ -71,6 +72,46 @@ pub(crate) fn decode_chunk_with_decoded_length(
             Ok((pattern_fill(pattern, logical_size), logical_size))
         }
     }
+}
+
+/// Decodes a zlib chunk that must verify itself: the stream has to end, with
+/// its Adler-32 matching, exactly at the end of `encoded`. Used for chunks whose
+/// table entry is unverified, where a damaged offset or size must not yield
+/// another stream's bytes.
+pub(crate) fn decode_zlib_exact(
+    encoded: &[u8],
+    logical_size: usize,
+    maximum_decoded_size: usize,
+) -> Result<Vec<u8>> {
+    if maximum_decoded_size < logical_size {
+        return Err(EwfError::Malformed(
+            "decoded chunk size bound is too small".into(),
+        ));
+    }
+    let capacity = maximum_decoded_size
+        .checked_add(1)
+        .ok_or_else(|| EwfError::Malformed("logical chunk size overflow".into()))?;
+    let mut output = vec![0; capacity];
+    let mut decompress = Decompress::new(true);
+    let status = decompress
+        .decompress(encoded, &mut output, FlushDecompress::Finish)
+        .map_err(|err| EwfError::Malformed(format!("chunk decompression failed: {err}")))?;
+    let consumed = decompress.total_in();
+    let produced = usize::try_from(decompress.total_out())
+        .map_err(|_| EwfError::Malformed("decoded chunk size does not fit usize".into()))?;
+    if status != Status::StreamEnd
+        || u64::try_from(encoded.len()).ok() != Some(consumed)
+        || produced < logical_size
+        || produced > maximum_decoded_size
+    {
+        return Err(EwfError::Malformed(format!(
+            "chunk is not a complete zlib stream of {logical_size} bytes filling its {} \
+             stored bytes",
+            encoded.len()
+        )));
+    }
+    output.truncate(logical_size);
+    Ok(output)
 }
 
 pub(crate) fn validate_encoded_size(
@@ -260,6 +301,26 @@ mod tests {
         assert!(decode_chunk_with_padding(&encoded, ChunkEncoding::Zlib, 7, 18).is_err());
         assert!(decode_chunk_with_padding(&encoded, ChunkEncoding::Zlib, 30, 32).is_err());
         assert!(decode_chunk(&encoded, ChunkEncoding::Zlib, 7).is_err());
+    }
+
+    #[test]
+    fn exact_zlib_decode_requires_the_whole_stream_and_its_checksum() {
+        let encoded = zlib(b"verified chunk");
+        assert_eq!(
+            decode_zlib_exact(&encoded, 14, 14).unwrap(),
+            b"verified chunk"
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_zlib_exact(&trailing, 14, 14).is_err());
+        assert!(decode_zlib_exact(&encoded[..encoded.len() - 1], 14, 14).is_err());
+        let mut damaged = encoded.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        assert!(decode_zlib_exact(&damaged, 14, 14).is_err());
+        assert!(decode_zlib_exact(&encoded, 13, 13).is_err());
+        assert_eq!(decode_zlib_exact(&encoded, 7, 14).unwrap(), b"verifie");
     }
 
     #[test]

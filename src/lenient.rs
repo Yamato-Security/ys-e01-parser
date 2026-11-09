@@ -21,6 +21,8 @@ pub(crate) enum DefectKind {
     MetadataUnavailable,
     /// Chunks that cannot be located; reading them fails.
     ChunksUnavailable,
+    /// Chunk table entries failed their checksum; each chunk must verify itself.
+    UnverifiedChunkTable,
     /// A chunk decoded to more bytes than the media holds; the extra bytes were dropped.
     OverlongChunk,
     /// Another irregularity that lenient opening accepted.

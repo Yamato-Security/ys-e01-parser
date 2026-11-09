@@ -12,8 +12,20 @@ use ewf_image::{
 
 const CHUNK: usize = 32_768;
 
-/// Media whose chunks all differ, so a chunk read from the wrong place shows.
+/// Compressible media whose chunks all differ, so a chunk read from the
+/// wrong place shows.
 fn media(chunks: usize) -> Vec<u8> {
+    (0..chunks * CHUNK)
+        .map(|index| {
+            let chunk = index / CHUNK;
+            let run = (index % CHUNK) / 48;
+            (run as u8).wrapping_mul(29) ^ (chunk as u8).wrapping_mul(37)
+        })
+        .collect()
+}
+
+/// Media that does not compress, so writers store its chunks raw.
+fn noise(chunks: usize) -> Vec<u8> {
     (0..chunks * CHUNK)
         .map(|index| {
             let chunk = index / CHUNK;
@@ -65,11 +77,15 @@ fn e01(compression: WriteCompression, chunks: usize) -> Written {
 }
 
 fn ex01(chunks: usize) -> Written {
+    ex01_of(&media(chunks))
+}
+
+fn ex01_of(data: &[u8]) -> Written {
     write_image(
         "image.Ex01",
         WriteFormat::Ewf2Physical,
         WriteCompression::Zlib,
-        &media(chunks),
+        data,
         |_| {},
     )
 }
@@ -707,4 +723,196 @@ fn damaged_first_volume_is_confirmed_by_a_later_copy() {
         [IntegrityFindingKind::StructureChecksumMismatch]
     );
     assert_eq!(read_all(&image), data);
+}
+
+/// Byte offset of EWF1 table entry `index` in a built image's `name` section.
+fn ewf1_entry(path: &Path, name: &str, index: u64) -> u64 {
+    built_section(path, name).data_offset + 24 + 4 * index
+}
+
+fn set_u32(path: &Path, offset: u64, value: u32) {
+    modify(path, |bytes| {
+        let start = usize::try_from(offset).unwrap();
+        bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
+    });
+}
+
+fn get_u32(path: &Path, offset: u64) -> u32 {
+    let bytes = std::fs::read(path).unwrap();
+    let start = usize::try_from(offset).unwrap();
+    u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+}
+
+#[test]
+fn damaged_table_entries_use_the_intact_table2() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build::libewf().write(&data);
+    flip(&path, ewf1_entry(&path, "table", 2));
+
+    assert!(open_strict(&path).is_err());
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert!(image.lenient_findings()[0].message.contains("table2"));
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn damaged_table_header_uses_the_matching_table2() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build::libewf().write(&data);
+    // The entry count.
+    flip(&path, built_section(&path, "table").data_offset);
+
+    assert!(open_strict(&path).is_err());
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn damaged_table_header_without_a_copy_leaves_its_chunks_unavailable() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build {
+        table2: false,
+        ..Ewf1Build::libewf()
+    }
+    .write(&data);
+    flip(&path, built_section(&path, "table").data_offset);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::ChunksUnavailable,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(readable_chunks(&image, &data), 0);
+}
+
+#[test]
+fn unverified_table_returns_only_chunks_that_verify_themselves() {
+    let data = media(6);
+    let (_dir, path) = Ewf1Build {
+        table2: false,
+        ..Ewf1Build::libewf()
+    }
+    .write(&data);
+    // Entry 1 now starts one byte late, so chunks 0 and 1 no longer fill
+    // their stored bytes with one zlib stream. Entry 4 repeats entry 5, so
+    // chunk 3's bytes now run on into chunk 4's stream.
+    let entry1 = ewf1_entry(&path, "table", 1);
+    set_u32(&path, entry1, get_u32(&path, entry1) + 1);
+    let entry5 = get_u32(&path, ewf1_entry(&path, "table", 5));
+    set_u32(&path, ewf1_entry(&path, "table", 4), entry5);
+
+    assert!(open_strict(&path).is_err());
+    let image = Image::open(&path).unwrap();
+    assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
+    // Chunks 2 and 5 still verify themselves.
+    assert_eq!(readable_chunks(&image, &data), 2);
+    let mut chunk = vec![0; CHUNK];
+    assert!(image.read_at(&mut chunk, 2 * CHUNK as u64).is_ok());
+    assert!(image.read_at(&mut chunk, 5 * CHUNK as u64).is_ok());
+    assert!(image.read_encoded_data_chunk(1).is_err());
+    assert!(image.read_encoded_data_chunk(2).is_ok());
+}
+
+#[test]
+fn unverified_table_returns_raw_chunks_only_with_their_checksum() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build {
+        compressed: false,
+        table2: false,
+        data_copy: true,
+    }
+    .write(&data);
+    // Chunk 0 grows by 4 bytes and chunk 1 loses its checksum.
+    let entry1 = ewf1_entry(&path, "table", 1);
+    set_u32(&path, entry1, get_u32(&path, entry1) + 4);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
+    assert_eq!(readable_chunks(&image, &data), 2);
+}
+
+/// Byte offset of EWF2 table entry `index` in an image written by this crate.
+fn ewf2_entry(path: &Path, index: u64) -> u64 {
+    ewf2_section(&sections(path), 0x04).data_offset + 32 + 16 * index
+}
+
+#[test]
+fn unverified_ewf2_table_returns_only_chunks_that_verify_themselves() {
+    let written = ex01(4);
+    // Chunk 1's stored size.
+    flip(&written.path, ewf2_entry(&written.path, 1) + 8);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
+    assert_eq!(readable_chunks(&image, &written.data), 3);
+}
+
+#[test]
+fn unverified_ewf2_entries_pointing_at_another_chunk_fail() {
+    // Compressed chunks, then raw chunks with checksums: either kind of chunk
+    // verifies itself, so only the overlap shows that entry 1 is wrong.
+    for data in [media(4), noise(4)] {
+        let written = ex01_of(&data);
+        let entry1 = ewf2_entry(&written.path, 1);
+        let entry2 = ewf2_entry(&written.path, 2);
+        // Entry 1 becomes a copy of entry 2: chunk 1 would read as chunk 2.
+        modify(&written.path, |bytes| {
+            let (from, to) = (
+                usize::try_from(entry2).unwrap(),
+                usize::try_from(entry1).unwrap(),
+            );
+            let copy = bytes[from..from + 16].to_vec();
+            bytes[to..to + 16].copy_from_slice(&copy);
+        });
+
+        let image = Image::open(&written.path).unwrap();
+        assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
+        assert_eq!(readable_chunks(&image, &written.data), 2);
+    }
+}
+
+#[test]
+fn damaged_ewf2_table_header_is_used_when_its_entries_confirm_it() {
+    let written = ex01(4);
+    let table = ewf2_section(&sections(&written.path), 0x04);
+    // The header checksum itself.
+    flip(&written.path, table.data_offset + 16);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn damaged_ewf2_table_header_with_a_wrong_count_is_not_used() {
+    let written = ex01(4);
+    let table = ewf2_section(&sections(&written.path), 0x04);
+    // The entry count.
+    flip(&written.path, table.data_offset + 8);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::ChunksUnavailable,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(readable_chunks(&image, &written.data), 0);
 }

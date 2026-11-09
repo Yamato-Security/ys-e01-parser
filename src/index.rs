@@ -18,6 +18,11 @@ pub(crate) struct TableRange {
     pub(crate) ewf1_allow_large_compressed_chunks: bool,
     pub(crate) ewf1_compression_method: Option<CompressionMethod>,
     pub(crate) ewf2_compression_method: Option<u16>,
+    /// False when the table's entries failed their checksum and no intact copy
+    /// exists. Each chunk is then returned only if its own checksum verifies it.
+    pub(crate) entries_verified: bool,
+    /// Start of the region holding this table's chunk data, when known.
+    pub(crate) data_start: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +177,8 @@ mod tests {
             ewf1_allow_large_compressed_chunks: false,
             ewf1_compression_method: Some(CompressionMethod::Zlib),
             ewf2_compression_method: None,
+            entries_verified: true,
+            data_start: None,
         }
     }
 
