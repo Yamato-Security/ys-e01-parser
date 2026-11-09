@@ -1,10 +1,36 @@
 # Changelog
 
-Changes are grouped by version. The 0.5.0 changes require source updates in some
-code written for 0.4.0. See
-[Migrating to 0.5](docs/migrating-to-0.5.md).
+ys-e01-parser 1.0.0 is Yamato Security's fork of Elijah Brigham's
+[ewf-image](https://github.com/ebrig/ewf-image); the versions before it are ewf-image's.
 
-## Unreleased
+## 1.0.0 (Unreleased)
+
+First version of Yamato Security's EWF reader, the E01 reader of Juntei: ewf-image at `04137ee`,
+imported with its history. (@YamatoSecurity)
+
+### Changed
+
+- Images open leniently by default. Damage that the data can still be checked without is gone
+  past and reported by `Image::lenient_findings` (and first in `Image::analyze`): truncated
+  segments, damaged section descriptors, volume, data and table sections (with their intact
+  copies, such as `table2`), and damaged hash, digest and header sections. A chunk that can't be
+  verified fails when read. `OpenStrictness::Strict` keeps ewf-image's behaviour. (@YamatoSecurity)
+- Writing EWF images and acquiring devices is behind the `writer` feature, off by default.
+  (@YamatoSecurity)
+- Only the library is kept, without ewf-cli and the experimental AFF4 crate. Named
+  `ys-e01-parser` 1.0.0 (library `ewf_image`), on Rust 1.99, under the RPL 1.5 with the Apache
+  License 2.0 kept for ewf-image's code. (@YamatoSecurity)
+- `tests/oracle.rs` compares the reads of 13 public images with libewf's. (@YamatoSecurity)
+
+### Fixed
+
+- An image whose last chunk decodes to more bytes than the media needs, as some writers store it,
+  failed to open; the media's bytes are read and an `OverlongChunk` warning is recorded.
+  (@YamatoSecurity)
+- EWF2 metadata compressed with a small zlib window was read as text, so an image could lose its
+  media size. (@YamatoSecurity)
+
+## ewf-image after 0.6.1 (04137ee)
 
 - Update the experimental AFF4 crate to ZIP 9, propagating filename decoding
   errors and preserving duplicate-name checks and legacy storage discovery.
@@ -271,7 +297,7 @@ These commands are available as `ewf-cli ewf <command>`.
 
 - `CompressionMethod` and `DataChunkEncoding` now expose a `Zstd` variant and
   are non-exhaustive. Downstream matches must include a wildcard arm. See
-  [Migrating to 0.3](docs/migrating-to-0.3.md).
+  [Migrating to 0.3](https://github.com/ebrig/ewf-image/blob/04137ee/docs/migrating-to-0.3.md).
 
 ### Added
 
@@ -303,7 +329,7 @@ These commands are available as `ewf-cli ewf <command>`.
 - `OpenOptions` fields are now private. Configure reader behavior with the
   `with_*` builders and inspect it with getters. This prevents future reader
   controls from breaking struct-literal callers. See
-  [Migrating to 0.2](docs/migrating-to-0.2.md).
+  [Migrating to 0.2](https://github.com/ebrig/ewf-image/blob/04137ee/docs/migrating-to-0.2.md).
 
 ### Added
 

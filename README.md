@@ -1,301 +1,111 @@
-# ewf-image
+# ys-e01-parser
 
-Read, verify, acquire, and convert forensic evidence images in pure Rust:
-EnCase-style `.E01`, `.L01`, `.S01`, `.Ex01`, and `.Lx01` images, AFF4
-containers, and raw disk images.
+Yamato Security's reader of EWF forensic images: EnCase's `.E01` (and `.S01`, `.L01`) and EWF2's
+`.Ex01` (and `.Lx01`), split into segments or not. It reads them without libewf, read-only, and
+leniently, so that what can be read of a damaged image is read and the damage is reported, and it
+never returns bytes it could not verify. It is the E01 reader of
+[Juntei](https://github.com/Yamato-Security/juntei), which mounts E01 images and scans the files in
+them (`juntei mount`, `auto-parse --e01`).
 
-[![Crates.io](https://img.shields.io/crates/v/ewf-image.svg)](https://crates.io/crates/ewf-image)
-[![Documentation](https://docs.rs/ewf-image/badge.svg)](https://docs.rs/ewf-image)
-[![CI](https://github.com/ebrig/ewf-image/actions/workflows/ci.yml/badge.svg)](https://github.com/ebrig/ewf-image/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+It is a fork of Elijah Brigham's [ewf-image](https://github.com/ebrig/ewf-image) (at `04137ee`,
+imported with its history), whose code stays under the Apache License 2.0 (see [Licence](#licence)).
 
-![ewf-image project banner](https://raw.githubusercontent.com/ebrig/ewf-image/main/docs/assets/ewf-image-banner.png)
-
-There are two ways to use this project:
-
-- **`ewf-cli`** is a single command-line tool for inspecting, verifying,
-  acquiring, converting, collecting, and extracting evidence in any supported
-  format.
-- **Rust libraries** let you embed the same functionality in your own tools:
-  [`ewf-image`](https://crates.io/crates/ewf-image) for EWF and the experimental
-  [`aff4-image`](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image)
-  for AFF4.
-
-## Highlights
-
-- **No external tools.** Pure Rust, with no libewf or AFF4 tooling required.
-  Both libraries forbid unsafe code.
-- **Verification you can check.** Decoded media is hashed and compared with the
-  MD5, SHA1, and SHA256 digests stored in the image, or with a digest you
-  recorded independently.
-- **Acquisition from disks and files.** Read-only device acquisition on Windows
-  and Linux, with resumable E01 acquisition and checkpoints.
-- **Conversion between formats.** Move decoded evidence between E01, Ex01, AFF4,
-  and raw, or between Lx01 and AFF4 logical collections. Each conversion is
-  verified, and metadata that cannot be carried over is reported.
-- **Logical evidence.** Browse L01, Lx01, and AFF4 file catalogs, verify
-  individual files, and extract them.
-- **Damaged images.** Scan for damage and recover readable data with a
-  provenance map.
-- **Safe by default.** Commands never overwrite existing files, and every result
-  is available as JSON for scripts.
-
-## Supported formats
-
-| Format | Extension | Read | Write |
-| --- | --- | --- | --- |
-| EWF1 physical | `.E01` | Raw and zlib; X-Ways Zstandard; X-Ways AES-128/AES-256 encryption | Raw and zlib |
-| EWF1 logical | `.L01` | Media and file catalog | Media and file catalog |
-| EWF1 SMART | `.S01` | Media | Media (library only) |
-| EWF2 physical | `.Ex01` | Raw, zlib, BZip2, and pattern-fill | Raw, zlib, BZip2, and pattern-fill |
-| EWF2 logical | `.Lx01` | Media and file catalog | Media and file catalog |
-| AFF4 physical (experimental) | `.aff4` | AFF4 1.0 single volumes and multi-volume sets | AFF4 1.0 single volumes |
-| AFF4 logical (experimental) | `.aff4` | AFF4-L 1.1 | AFF4-L 1.1 |
-| Raw | `.raw`, `.dd`, `.img`, `.bin` | Yes (CLI) | Yes (CLI) |
-
-Split EWF segment sets are found automatically. Encrypted X-Ways EWF1 images open
-with a password. Encrypted EWF2 images, encrypted output, EWF delta (overlay)
-images, and AFF4 encryption are not supported.
-[Compatibility](docs/compatibility.md) describes tested producers and consumers,
-[limitations](docs/limitations.md) lists unsupported workflows, and the
-[`aff4-image` guide](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image#supported-profiles)
-lists the supported AFF4 profiles in detail.
-
-## Command-line tool
-
-`ewf-cli` is not yet published as a package or prebuilt binary. Build it from
-this repository with Rust 1.96 or later:
-
-```sh
-git clone https://github.com/ebrig/ewf-image
-cd ewf-image
-cargo install --path crates/ewf-cli --locked
-```
-
-### Common tasks
-
-```text
-# Inspect and verify
-ewf-cli info case.E01
-ewf-cli verify case.E01
-ewf-cli verify case.E01 --sha256 HASH
-
-# Acquire a disk (the output extension selects the format)
-sudo ewf-cli acquire /dev/sdb case.E01
-ewf-cli acquire \\.\PhysicalDrive2 case.aff4 --case-number CASE-123
-
-# Convert between formats
-ewf-cli convert case.E01 case.aff4
-ewf-cli convert case.aff4 exported.raw
-
-# Collect a folder into a logical image, then list and extract files
-ewf-cli collect evidence-folder files.Lx01
-ewf-cli files files.Lx01
-ewf-cli extract files.Lx01 2 recovered.bin --restore-times
-```
-
-The output extension selects the format: `.E01`, `.Ex01`, `.aff4`, or a raw
-extension for disk images, and `.Lx01` or `.aff4` for logical collections. Input
-containers are detected by signature. Add `--json` for machine-readable results
-and `--quiet` to hide progress. Run `ewf-cli <command> --help` for options.
-
-Device acquisition may require administrator or root access. It does not freeze
-a live disk, so use a stable source or a snapshot. Directory collection does not
-create a filesystem snapshot either.
-
-| Exit code | Meaning |
-| --- | --- |
-| 0 | Completed with its stated verification scope |
-| 1 | Operational failure |
-| 2 | Invalid command syntax |
-| 3 | Verification mismatch or analysis errors |
-| 4 | Incomplete references, metadata omissions, or other findings |
-| 130 | Cancelled |
-
-The [CLI guide](docs/ewf-cli.md) covers device acquisition, supported
-conversions, verification scope, and JSON output. The [EWF command
-guide](docs/cli.md) covers damage analysis, recovery, resume, and advanced
-acquisition options.
-
-## Rust library
-
-The examples below target `ewf-image` 0.6.1. See the
-[changelog](CHANGELOG.md#061---2026-10-11) for its changes. The
-[0.5 migration guide](docs/migrating-to-0.5.md) remains available for upgrades
-from 0.4. For AFF4,
-see the [`aff4-image` crate](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image).
-`ewf-image` has no AFF4 dependencies.
+| Crate | Library | What it reads |
+| --- | --- | --- |
+| `ys-e01-parser` | `ewf_image` | EWF1 (`.E01`, `.S01`, `.L01`) and EWF2 (`.Ex01`, `.Lx01`) segment sets: the media, its metadata and stored hashes, acquisition errors, logical file catalogs, and X-Ways encrypted EWF1 images given their password. With the `writer` feature, it also writes EWF images and acquires devices. |
 
 ```toml
 [dependencies]
-ewf-image = "0.6.1"
+ewf_image = { package = "ys-e01-parser", git = "https://github.com/Yamato-Security/ys-e01-parser" }
 ```
-
-The crate requires Rust 1.96 or later. Its runtime features are:
-
-| Feature | Effect |
-| --- | --- |
-| `verify` | Media verification, per-file verification, and integrity analysis. Enabled by default. |
-| `parallel` | Verification across multiple worker threads. Enables `verify`. |
-| `serde` | Serialization of reports and metadata types. |
-
-Stored-hash parsing, section integrity checks, and writer hashing remain available
-with `default-features = false`.
-
-### Read an image
-
-Open the first segment. The remaining segments are found automatically.
 
 ```rust,no_run
 use std::io::Read;
 
-fn main() -> ewf_image::Result<()> {
-    let image = ewf_image::Image::open("case.E01")?;
-    let info = image.info();
-    println!("{:?}, {} bytes in {} segments", info.format, info.logical_size, info.segment_count);
-
-    // Read sequentially through a Read + Seek cursor.
-    let mut first_sector = [0u8; 512];
-    image.cursor().read_exact(&mut first_sector)?;
-
-    // Or read at an absolute offset without a cursor.
-    let mut buffer = [0u8; 4096];
-    image.read_at(&mut buffer, 1024 * 1024)?;
-    Ok(())
+let image = ewf_image::Image::open("host1.E01")?; // finds host1.E02, host1.E03, ...
+for finding in image.lenient_findings() {
+    println!("{:?}: {}", finding.kind, finding.message);
 }
+let mut sector = [0_u8; 512];
+image.cursor().read_exact(&mut sector)?; // a Read + Seek over the media
+image.read_at(&mut sector, 1 << 20)?; // or read at an offset; Image is a cheap shared handle
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`Image` is a cheap, shareable handle. Clones and cursors share bounded caches,
-so one image can serve many readers. `OpenOptions` adjusts cache sizes, handle
-limits, and strictness. Encrypted X-Ways images open with
-`Image::open_with_password`. Segment files must remain unchanged while an image
-is open.
+The guides in [docs/](docs/) describe ewf-image's compatibility, limitations and analysis
+functions, which this fork keeps.
 
-### Verify an image
+## Why ewf-image
 
-`verify` decodes the complete media and compares it with the digests stored in
-the image. Verification bypasses caches, so corrupt data cannot pass as valid.
+Six pure-Rust EWF readers were compared with libewf (pyewf 20260924) on public images, byte by
+byte: SecurityRonin's `ewf` 0.4.10, `ewf-image` 0.6.1, `sootmark-ewf` 0.1.3, `inodex` 0.1.2,
+keramics' `keramics-formats` 0.0.1, and the `ewf` crate of Omer Ben-Amram's `mft`.
 
-```rust,no_run
-use ewf_image::{Image, VerifyOptions};
+- **Public images:** 39 images from dfvfs, plaso, keramics, SecurityRonin's ewf-forensic,
+  Sootmark's ewf, Velociraptor, `mft`, ewf-image's X-Ways encrypted samples and Digital Corpora,
+  including three Windows disks of 10 to 40 GiB in one to three segments. `ewf-image` read every
+  byte as libewf did, except one image whose last chunk decodes to more bytes than the media needs
+  (fixed here), two X-Ways encrypted images (which need their password) and two crafted fuzz
+  files.
+- **Damaged images:** 750 copies of five images (four EWF1 images written by libewf's tools, one
+  of them split in 8 segments, and an Ex01 written by EnCase 7) with bits flipped, 32-bit fields
+  overwritten or segments cut short, each read in 32 KiB units and compared with the undamaged
+  image:
 
-fn main() -> ewf_image::Result<()> {
-    let image = Image::open("case.E01")?;
+| Reader | Opened | Images with units read wrong without an error | Crashes |
+| --- | ---: | ---: | ---: |
+| libewf | 570 | 373 | 0 |
+| SecurityRonin `ewf` | 702 | 328 | 12 (allocation aborts) |
+| `ewf-image` | 402 | 0 | 0 |
+| `sootmark-ewf` | 451 | 0 | 0 |
+| `inodex` | 337 | 0 | 0 |
+| `mft`'s `ewf` | 488 | 136 | 0 |
+| `keramics-formats` | 346 | 276 | 0 |
+| **this fork** | **749** | **0** | **0** |
 
-    let result = image.verify()?;
-    println!("MD5 match: {:?}", result.md5_match);
-    println!("SHA256 match: {:?}", result.sha256_match);
+`ewf-image` was the only complete reader that never returned wrong bytes: libewf and three others
+return damaged or misplaced data as if it were the media. It refused to open many damaged images
+instead, which is what this fork changes.
 
-    // Compare against a digest recorded outside the image.
-    let acquisition_sha256 = [0u8; 32]; // Replace with the recorded value.
-    let options = VerifyOptions::default().with_expected_sha256(acquisition_sha256);
-    let report = image.verify_with_options(&options)?;
-    println!("references match: {:?}", report.references_match());
-    Ok(())
-}
-```
+## Changes from ewf-image
 
-A match value of `None` means the image stores no digest of that type. A match
-shows that the decoded media equals what was hashed at acquisition. It cannot
-show whether unreadable source sectors were replaced with zeros at that time. See
-[verification, analysis, and recovery](docs/reader-analysis.md).
+- **Lenient by default.** `OpenOptions::default()` is lenient. Damage that the data can still be
+  checked without is gone past and reported by `Image::lenient_findings` (and first in
+  `Image::analyze`): a truncated segment keeps its complete sections, and its chunks are found
+  by decoding them in order when its tables were lost; a damaged volume, data or table section
+  uses its intact copy (`table2`, the other geometry section, a later segment's); a damaged
+  section descriptor is followed when its offsets agree with the file; damaged hash, digest and
+  header sections are left out. A chunk that can't be verified (zlib's Adler-32, a raw chunk's
+  checksum) fails when read, and nothing else is substituted. `OpenStrictness::Strict` keeps
+  ewf-image's behaviour.
+- **An overlong last chunk**, which some writers store with more bytes than the media needs, gives
+  the media's bytes with an `OverlongChunk` warning instead of failing.
+- **EWF2 metadata compressed with a small zlib window** is decompressed, not read as text.
+- **Read-only by default.** Writing EWF images and acquiring devices is behind the `writer`
+  feature, which readers of evidence leave off. The images it reads are only opened for reading.
+- **Only the library.** ewf-image's command-line tool (`ewf-cli`, which acquires, converts and
+  collects) and its experimental AFF4 crate are not kept.
+- Named `ys-e01-parser` 1.0.0 (its library keeps the name `ewf_image`), Rust 1.99, under the RPL.
 
-### Work with logical files
+## Validation
 
-Logical images (`.L01` and `.Lx01`) contain a catalog of files and folders.
+- **Against libewf:** `tests/oracle.rs` reads 13 public images in [tests/fixtures/](tests/fixtures/)
+  (EnCase 5 and 6, `ewfacquire`, split sets, Ex01 compressed and not) and compares the media size,
+  the SHA-256 of the whole media and of 2,000 seeded random reads with libewf's.
+- **Damaged images:** the 750 copies above and 1,010 more (including multi-segment EWF1 and EWF2
+  images), read with overflow checks on: no panic, no wrong data; 1,754 of the 1,760 open.
+  `tests/lenient.rs` checks each case the fork goes past.
+- **The upstream tests:** `cargo test --all-features` runs ewf-image's tests too (664 in all).
 
-```rust,no_run
-use ewf_image::{Image, SingleFileEntryType};
-use std::{fs::File, io};
+One thing found on the way: libewf reads 3 chunks of an image written by the `writer` feature as
+zeros, where the Rust readers read the bytes that were written. Images written by libewf's
+`ewfacquire` read the same in both.
 
-fn main() -> ewf_image::Result<()> {
-    let image = Image::open("files.L01")?;
-    let Some(root) = image.root_file_entry() else {
-        println!("not a logical image");
-        return Ok(());
-    };
+## Licence
 
-    for entry in &root.children {
-        println!("{} ({} bytes)", entry.name().unwrap_or("?"), entry.size().unwrap_or(0));
-    }
-
-    let first_file = root
-        .children
-        .iter()
-        .find(|entry| entry.entry_type() == Some(SingleFileEntryType::File));
-    if let Some(entry) = first_file {
-        let check = image.verify_single_file(entry)?;
-        println!("stored file hashes match: {:?}", check.references_match());
-
-        let mut output = File::create_new("extracted.bin")?;
-        io::copy(&mut image.single_file_cursor(entry), &mut output)?;
-    }
-    Ok(())
-}
-```
-
-Extraction copies file content only. Timestamps and other recorded metadata
-remain available on each catalog entry but are not applied to extracted files.
-The `ewf-cli extract --restore-times` option applies recorded file access and
-modification times to a selected new output file.
-
-### Write an image
-
-`EwfWriter` creates EWF1 or EWF2 images from any readable source.
-
-```rust,no_run
-use ewf_image::{EwfWriter, WriteCompression, WriteFormat, WriteOptions};
-use std::{fs::File, io};
-
-fn main() -> ewf_image::Result<()> {
-    let mut options = WriteOptions {
-        format: WriteFormat::Ewf2Physical,
-        compression: WriteCompression::Zlib,
-        ..WriteOptions::default()
-    };
-    options.metadata.set_header_value("case_number", "CASE-001");
-
-    let mut writer = EwfWriter::create("case.Ex01", options)?;
-    io::copy(&mut File::open("disk.raw")?, &mut writer)?;
-    let result = writer.finish()?;
-    println!("wrote {} segments", result.segment_paths.len());
-    Ok(())
-}
-```
-
-`EwfWriter` supports every output format and positioned writes, but it spools
-the complete source to temporary storage. Specialized writers cover large or
-long-running jobs:
-
-- `AcquisitionWriter` acquires physical E01 images with checkpoints and can
-  resume after an interruption.
-- `SequentialWriter` streams known-length E01, Ex01, and Lx01 output and stages
-  one segment at a time. The CLI uses it for E01 conversion.
-- `LogicalWriter` builds L01 and Lx01 file catalogs from files you supply.
-
-Writers return computed MD5, SHA1, and SHA256 digests but do not reread their
-output. [Acquisition and writing](docs/acquisition.md) explains resume,
-publication, and recovery for each writer.
-
-## Documentation
-
-- Command line: [CLI guide](docs/ewf-cli.md) and [EWF command guide](docs/cli.md)
-- Library: [API reference](https://docs.rs/ewf-image) and [runnable examples](examples)
-- AFF4: [`aff4-image` guide](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image)
-- [Verification, analysis, and recovery](docs/reader-analysis.md)
-- [Acquisition and writing](docs/acquisition.md)
-- [Compatibility](docs/compatibility.md) and [limitations](docs/limitations.md)
-- [Architecture](docs/architecture.md) and [testing](docs/testing.md)
-- [Release process](RELEASING.md)
-- Upgrading: [0.5 guide](docs/migrating-to-0.5.md),
-  [0.4 release notes](CHANGELOG.md#040---2026-09-12),
-  [0.3 guide](docs/migrating-to-0.3.md), [0.2 guide](docs/migrating-to-0.2.md)
-
-## Contributing and security
-
-Read [Contributing](CONTRIBUTING.md) before opening a pull request. Report
-vulnerabilities privately as described in the [security policy](SECURITY.md).
-
-## License
-
-Licensed under the [Apache License 2.0](LICENSE).
+ys-e01-parser is copyright Shirofune Security Co., Ltd. and released under the [Reciprocal Public
+License 1.5](LICENSE) (RPL-1.5). It is changed from [ebrig/ewf-image](https://github.com/ebrig/ewf-image)
+(copyright Elijah Brigham), whose code stays under the Apache License 2.0
+([LICENSE-APACHE](LICENSE-APACHE)): each Rust file from it says so in its header, and the crate is
+`RPL-1.5 AND Apache-2.0`. The test images keep their licences, given in
+[tests/fixtures/README.md](tests/fixtures/README.md).
