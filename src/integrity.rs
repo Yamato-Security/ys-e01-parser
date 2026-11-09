@@ -54,8 +54,9 @@ pub enum IntegrityFindingKind {
     /// segment's section chain was ignored.
     BrokenSectionChain,
     /// A stored checksum of a section descriptor, media geometry, or chunk table
-    /// header did not match. Lenient opening used an intact copy or values that
-    /// it could check against the rest of the image.
+    /// did not match. The message says what lenient opening did instead: used
+    /// an intact copy, used values that it could check against the rest of the
+    /// image, or left the structure unused.
     StructureChecksumMismatch,
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.

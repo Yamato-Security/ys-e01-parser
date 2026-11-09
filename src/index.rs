@@ -4,6 +4,9 @@ use crate::{CompressionMethod, EwfError, Result};
 pub(crate) enum TableRangeKind {
     Ewf1,
     Ewf2,
+    /// EWF1 chunks located without a table by decoding them in sequence;
+    /// `entries_offset` indexes the image's list of carved chunk runs.
+    Ewf1Carved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

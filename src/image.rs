@@ -105,6 +105,9 @@ struct ImageInner {
     read_defects: Mutex<Vec<Defect>>,
     /// Chunks of unverified EWF2 tables whose entries are inconsistent, sorted.
     rejected_chunks: Vec<u64>,
+    /// Runs of EWF1 chunks located by decoding them in sequence, for segments
+    /// whose table was lost; `TableRangeKind::Ewf1Carved` ranges index them.
+    carved_chunks: Vec<Vec<CarvedChunk>>,
     read_zero_chunk_on_error: AtomicBool,
     abort_signaled: AtomicBool,
 }
@@ -608,6 +611,7 @@ impl Image {
         let mut ewf1_geometry_unverified: Option<String> = None;
         let mut ewf2_next_chunk = 0_u64;
         let mut rejected_chunks = Vec::new();
+        let mut carved_chunks = Vec::new();
         let mut expected_set_identifier: Option<[u8; 16]> = None;
         let mut expected_ewf1_media = None;
         let mut expected_ewf1_compression_method = None;
@@ -642,6 +646,7 @@ impl Image {
                         } else {
                             0
                         },
+                        carving_allowed: ewf1_positions_known && encryption_context.is_none(),
                         inherited_media_geometry: expected_ewf1_media,
                         ewf2_expected_first_chunk: ewf2_next_chunk,
                     },
@@ -789,6 +794,29 @@ impl Image {
                     .checked_add(parsed.table_chunk_count)
                     .ok_or_else(|| EwfError::Malformed("EWF1 chunk count overflow".into()))?;
                 ewf1_positions_known = parsed.ewf1_chain_complete;
+                if !parsed.ewf1_carved.is_empty() {
+                    let count = u64::try_from(parsed.ewf1_carved.len())
+                        .map_err(|_| EwfError::Malformed("carved chunk count overflow".into()))?;
+                    ranges.push(TableRange {
+                        kind: TableRangeKind::Ewf1Carved,
+                        segment_index,
+                        first_chunk: next_ewf1_chunk,
+                        chunk_count: count,
+                        entries_offset: u64::try_from(carved_chunks.len())
+                            .map_err(|_| EwfError::Malformed("carved run count overflow".into()))?,
+                        base_offset: 0,
+                        data_end: None,
+                        ewf1_allow_large_compressed_chunks: false,
+                        ewf1_compression_method: None,
+                        ewf2_compression_method: None,
+                        entries_verified: false,
+                        data_start: None,
+                    });
+                    carved_chunks.push(parsed.ewf1_carved);
+                    next_ewf1_chunk = next_ewf1_chunk
+                        .checked_add(count)
+                        .ok_or_else(|| EwfError::Malformed("EWF1 chunk count overflow".into()))?;
+                }
             }
             ranges.extend(parsed.ranges);
         }
@@ -956,6 +984,7 @@ impl Image {
                     rejected_chunks.dedup();
                     rejected_chunks
                 },
+                carved_chunks,
                 read_zero_chunk_on_error: AtomicBool::new(options.read_zero_chunk_on_error()),
                 abort_signaled: AtomicBool::new(false),
             }),
@@ -1963,6 +1992,26 @@ impl Image {
         match range.kind {
             TableRangeKind::Ewf1 => self.lookup_ewf1_chunk(range, local_index, logical_size),
             TableRangeKind::Ewf2 => self.lookup_ewf2_chunk(range, local_index, logical_size),
+            TableRangeKind::Ewf1Carved => {
+                let carved = usize::try_from(range.entries_offset)
+                    .ok()
+                    .and_then(|run| self.inner.carved_chunks.get(run))
+                    .and_then(|run| run.get(usize::try_from(local_index).ok()?))
+                    .ok_or_else(|| EwfError::Malformed("carved chunk is missing".into()))?;
+                Ok(Chunk {
+                    segment_index: range.segment_index,
+                    offset: carved.offset,
+                    encoded_size: u64::from(carved.size),
+                    logical_size,
+                    encoding: if carved.raw {
+                        ChunkEncoding::Raw
+                    } else {
+                        ChunkEncoding::Zlib
+                    },
+                    validate_checksum: carved.raw,
+                    self_verify: true,
+                })
+            }
         }
     }
 
@@ -2989,6 +3038,9 @@ struct ParsedSegment {
     /// EWF1: the section chain was followed to its end, so `table_chunk_count`
     /// is the segment's chunk count rather than a lower bound.
     ewf1_chain_complete: bool,
+    /// EWF1: chunks after the segment's tables, located by decoding them in
+    /// sequence because their table was lost.
+    ewf1_carved: Vec<CarvedChunk>,
     /// EWF1: why the media geometry is unverified, when lenient opening used a
     /// damaged copy tentatively; it must then agree with the rest of the image.
     /// `None` when it came from an intact section (or there was none).
@@ -3031,9 +3083,163 @@ struct Ewf1MediaGeometry {
 #[derive(Clone, Copy)]
 struct Ewf1SegmentContext {
     first_chunk: u64,
+    /// `first_chunk` is the segment's real position and its chunk data is not
+    /// encrypted, so chunks whose table was lost may be located by decoding.
+    carving_allowed: bool,
     inherited_media_geometry: Option<Ewf1MediaGeometry>,
     /// EWF2: the end of the previous segments' tables.
     ewf2_expected_first_chunk: u64,
+}
+
+/// Where a run of chunks located by decoding belongs in the media.
+#[derive(Clone, Copy)]
+struct CarvePosition {
+    segment_index: usize,
+    first_chunk: u64,
+    geometry: Ewf1MediaGeometry,
+}
+
+/// An EWF1 chunk located by decoding, without a table entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CarvedChunk {
+    offset: u64,
+    size: u32,
+    /// Stored uncompressed, followed by its Adler-32.
+    raw: bool,
+}
+
+/// Locates the chunks of sectors sections whose table was lost, by decoding
+/// them in order from the start of the first such section.
+///
+/// EWF1 writers store a segment's chunks back to back in chunk order, so each
+/// chunk starts where the previous one ends. A chunk is accepted only if it
+/// verifies itself in exactly one way: as a zlib stream whose Adler-32 matches
+/// and which decodes to exactly the chunk's size, or as the chunk's bytes
+/// followed by their Adler-32. The first chunk that does neither, or both, ends
+/// the run, because the next chunk's start is then unknown. Sectors sections
+/// before the first uncovered one must all be covered by tables, so that
+/// `first_chunk` numbers the run; a later section continues the run only if
+/// the previous one was used up exactly.
+fn carve_uncovered_ewf1_sectors(
+    file: &mut dyn SegmentReader,
+    sections: &[Section],
+    partial: Option<&Section>,
+    ranges: &[TableRange],
+    position: CarvePosition,
+    leniency: &mut Leniency,
+) -> Result<Vec<CarvedChunk>> {
+    let CarvePosition {
+        segment_index,
+        first_chunk,
+        geometry,
+    } = position;
+    let covered = |section: &Section| {
+        ranges
+            .iter()
+            .any(|range| range.data_start == Some(section.data_offset))
+    };
+    let sectors: Vec<&Section> = sections
+        .iter()
+        .chain(partial)
+        .filter(|section| section.desc.section_type == "sectors" && section.data_size > 0)
+        .collect();
+    let Some(first_uncovered) = sectors.iter().position(|section| !covered(section)) else {
+        return Ok(Vec::new());
+    };
+    let Some(uncovered) = sectors.get(first_uncovered..) else {
+        return Ok(Vec::new());
+    };
+    if uncovered.iter().any(|section| covered(section)) {
+        return Ok(Vec::new());
+    }
+    let total_chunks =
+        crate::index::logical_chunk_count(geometry.logical_size, geometry.chunk_size)?;
+    let mut carved = Vec::new();
+    let mut chunk = first_chunk;
+    for section in uncovered {
+        let end = section.data_offset.saturating_add(section.data_size);
+        let mut position = section.data_offset;
+        while position < end && chunk < total_chunks {
+            let logical = logical_chunk_size(geometry.logical_size, geometry.chunk_size, chunk)?;
+            let Some(found) = locate_ewf1_chunk(file, position, end, logical, geometry.chunk_size)?
+            else {
+                break;
+            };
+            position = position.saturating_add(u64::from(found.size));
+            carved.push(found);
+            chunk += 1;
+        }
+        if position != end {
+            break;
+        }
+    }
+    if !carved.is_empty() {
+        leniency.record(
+            DefectKind::UnverifiedChunkTable,
+            Some(segment_index),
+            uncovered.first().map(|section| section.desc.offset),
+            format!(
+                "the chunk table of this sectors data is missing; {} chunks from chunk \
+                 {first_chunk} were located by decoding them in order, and each is returned \
+                 only when its own checksum verifies it",
+                carved.len()
+            ),
+        );
+    }
+    Ok(carved)
+}
+
+/// The chunk stored at `position`, when it verifies itself in exactly one way.
+fn locate_ewf1_chunk(
+    file: &mut dyn SegmentReader,
+    position: u64,
+    end: u64,
+    logical: usize,
+    chunk_size: u64,
+) -> Result<Option<CarvedChunk>> {
+    let raw_size = u64::try_from(logical)
+        .ok()
+        .and_then(|size| size.checked_add(4))
+        .ok_or_else(|| EwfError::Malformed("chunk size overflow".into()))?;
+    let window = zlib_compressed_chunk_size_cap(chunk_size)?
+        .max(raw_size)
+        .min(end - position);
+    let bytes = read_exact_at(file, position, window)?;
+    let zlib = zlib_stream_length(&bytes, logical);
+    let raw = bytes
+        .get(..logical)
+        .zip(bytes.get(logical..logical + 4))
+        .is_some_and(|(data, checksum)| {
+            <[u8; 4]>::try_from(checksum)
+                .is_ok_and(|stored| adler32(data) == u32::from_le_bytes(stored))
+        });
+    Ok(match (zlib, raw) {
+        (Some(size), false) => u32::try_from(size).ok().map(|size| CarvedChunk {
+            offset: position,
+            size,
+            raw: false,
+        }),
+        (None, true) => u32::try_from(raw_size).ok().map(|size| CarvedChunk {
+            offset: position,
+            size,
+            raw: true,
+        }),
+        _ => None,
+    })
+}
+
+/// Length of the zlib stream at the start of `bytes`, when it ends with a
+/// matching Adler-32 after decoding to exactly `logical` bytes.
+fn zlib_stream_length(bytes: &[u8], logical: usize) -> Option<usize> {
+    let mut output = vec![0; logical.checked_add(1)?];
+    let mut decompress = flate2::Decompress::new(true);
+    let status = decompress
+        .decompress(bytes, &mut output, flate2::FlushDecompress::Finish)
+        .ok()?;
+    (status == flate2::Status::StreamEnd
+        && usize::try_from(decompress.total_out()).ok()? == logical)
+        .then(|| usize::try_from(decompress.total_in()).ok())
+        .flatten()
 }
 
 /// Accepts media geometry read from a damaged section only when the image
@@ -3187,6 +3393,7 @@ fn parse_ewf1_segment(
     let chain = scan_ewf1_sections(file, segment_index, leniency)?;
     let acquisition_complete = ewf1_acquisition_complete(&chain);
     let chain_complete = chain.complete;
+    let partial_section = chain.partial;
     let sections = chain.sections;
     let compression_method = detect_ewf1_compression_method(file_header, &sections)?;
     let (volume, unverified_geometry) =
@@ -3358,6 +3565,31 @@ fn parse_ewf1_segment(
             .checked_add(range.chunk_count)
             .ok_or_else(|| EwfError::Malformed("EWF1 table chunk count overflow".into()))
     })?;
+    let carved = if leniency.is_lenient()
+        && !(chain_complete && ranges_complete)
+        && context.carving_allowed
+        && compression_method == CompressionMethod::Zlib
+        && !file_header.logical
+        && !smart_profile
+        && let Some(geometry) = ewf1_media_geometry
+            .filter(|_| unverified_geometry.is_none())
+            .or(inherited_media_geometry)
+    {
+        carve_uncovered_ewf1_sectors(
+            file,
+            &sections,
+            partial_section.as_ref(),
+            &ranges,
+            CarvePosition {
+                segment_index,
+                first_chunk: first_chunk.saturating_add(table_chunk_count),
+                geometry,
+            },
+            leniency,
+        )?
+    } else {
+        Vec::new()
+    };
     Ok(ParsedSegment {
         format: Format::Ewf1,
         sections: sections
@@ -3386,6 +3618,7 @@ fn parse_ewf1_segment(
         ranges,
         table_chunk_count,
         ewf1_chain_complete: chain_complete && ranges_complete,
+        ewf1_carved: carved,
         ewf1_geometry_unverified: unverified_geometry,
         rejected_chunks: Vec::new(),
         metadata,
@@ -4148,6 +4381,7 @@ fn parse_ewf2_segment(
         ranges,
         table_chunk_count,
         ewf1_chain_complete: true,
+        ewf1_carved: Vec::new(),
         ewf1_geometry_unverified: None,
         rejected_chunks,
         metadata,
@@ -4173,6 +4407,8 @@ struct Ewf1Chain {
     /// False when lenient opening stopped at a truncated or damaged descriptor,
     /// so that later sections of the segment, and their chunk tables, are unknown.
     complete: bool,
+    /// The section the segment ends inside, with the size that is present.
+    partial: Option<Section>,
 }
 
 fn scan_ewf1_sections(
@@ -4188,6 +4424,7 @@ fn scan_ewf1_sections(
         Ok(Ewf1Chain {
             sections,
             complete: false,
+            partial: None,
         })
     };
     loop {
@@ -4265,7 +4502,15 @@ fn scan_ewf1_sections(
                     desc.section_type
                 ),
             )?;
-            return incomplete(sections);
+            return Ok(Ewf1Chain {
+                sections,
+                complete: false,
+                partial: Some(Section {
+                    desc,
+                    data_offset,
+                    data_size: file_len - data_offset,
+                }),
+            });
         };
         let section_type = desc.section_type.clone();
         let next = desc.next;
@@ -4278,6 +4523,7 @@ fn scan_ewf1_sections(
             return Ok(Ewf1Chain {
                 sections,
                 complete: true,
+                partial: None,
             });
         }
         if next <= offset {
@@ -5447,10 +5693,11 @@ fn parse_ewf1_ranges(
                     let Some(replacement) = replacement else {
                         leniency.tolerate(
                             error,
-                            DefectKind::ChunksUnavailable,
+                            DefectKind::ChecksumMismatch,
                             segment_index,
                             section.desc.offset,
-                            LATER_CHUNKS_UNKNOWN,
+                            "no intact copy exists, so the table is not used and its chunk count, \
+                             which places the segment's later chunks, is unknown",
                         )?;
                         complete = false;
                         break;
@@ -5803,7 +6050,7 @@ fn parse_ewf2_ranges(
             if entry_count == 0 || !stored_entries_checksum || header.first_chunk != expected_next {
                 leniency.tolerate(
                     error,
-                    DefectKind::ChunksUnavailable,
+                    DefectKind::ChecksumMismatch,
                     segment_index,
                     section.desc.offset,
                     NOT_USED,

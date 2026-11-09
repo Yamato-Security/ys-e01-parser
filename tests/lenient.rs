@@ -351,7 +351,7 @@ fn truncate(path: &Path, length: u64) {
 }
 
 #[test]
-fn truncated_segment_keeps_its_complete_sections() {
+fn truncated_segment_keeps_its_complete_sections_and_decodes_the_rest() {
     let written = e01(WriteCompression::Zlib, 4);
     let sectors = ewf1_section(&sections(&written.path), 0, "sectors");
     truncate(&written.path, sectors.data_offset + sectors.data_size / 2);
@@ -363,6 +363,7 @@ fn truncated_segment_keeps_its_complete_sections() {
         kinds(&image),
         [
             IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::UnverifiedChunkTable,
             IntegrityFindingKind::ChunksUnavailable
         ]
     );
@@ -370,9 +371,10 @@ fn truncated_segment_keeps_its_complete_sections() {
         image.lenient_findings()[0].segment_offset,
         Some(sectors.descriptor_offset)
     );
-    assert_eq!(image.lenient_findings()[1].chunk_index, Some(0));
-    // The tables followed the sectors section, so no chunk can be located.
-    assert_eq!(readable_chunks(&image, &written.data), 0);
+    // The tables followed the sectors section and are lost. The chunks that
+    // are complete are found by decoding them in order; the rest fail.
+    assert_eq!(image.lenient_findings()[2].chunk_index, Some(2));
+    assert_eq!(readable_chunks(&image, &written.data), 2);
 }
 
 #[test]
@@ -524,11 +526,12 @@ fn damaged_descriptor_with_inconsistent_offsets_stops_the_segment() {
         kinds(&image),
         [
             IntegrityFindingKind::BrokenSectionChain,
-            IntegrityFindingKind::ChunksUnavailable
+            IntegrityFindingKind::UnverifiedChunkTable
         ]
     );
     assert_eq!(image.lenient_findings()[0].segment_offset, Some(table));
-    assert_eq!(readable_chunks(&image, &written.data), 0);
+    // The tables are lost; the chunks are found by decoding them in order.
+    assert_eq!(read_all(&image), written.data);
 }
 
 /// A single EWF1 segment laid out the way the common writers lay it out:
@@ -776,7 +779,7 @@ fn damaged_table_header_uses_the_matching_table2() {
 }
 
 #[test]
-fn damaged_table_header_without_a_copy_leaves_its_chunks_unavailable() {
+fn damaged_table_header_without_a_copy_locates_the_chunks_by_decoding() {
     let data = media(4);
     let (_dir, path) = Ewf1Build {
         table2: false,
@@ -789,11 +792,11 @@ fn damaged_table_header_without_a_copy_leaves_its_chunks_unavailable() {
     assert_eq!(
         kinds(&image),
         [
-            IntegrityFindingKind::ChunksUnavailable,
-            IntegrityFindingKind::ChunksUnavailable
+            IntegrityFindingKind::StructureChecksumMismatch,
+            IntegrityFindingKind::UnverifiedChunkTable
         ]
     );
-    assert_eq!(readable_chunks(&image, &data), 0);
+    assert_eq!(read_all(&image), data);
 }
 
 #[test]
@@ -910,7 +913,7 @@ fn damaged_ewf2_table_header_with_a_wrong_count_is_not_used() {
     assert_eq!(
         kinds(&image),
         [
-            IntegrityFindingKind::ChunksUnavailable,
+            IntegrityFindingKind::StructureChecksumMismatch,
             IntegrityFindingKind::ChunksUnavailable
         ]
     );
@@ -1024,4 +1027,83 @@ fn damaged_ewf2_descriptor_is_skipped_by_finding_the_chain_again() {
     assert!(image.sha1_hash().is_some());
     assert!(image.info().acquisition_complete);
     assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn truncated_raw_chunks_are_located_by_their_checksums() {
+    let data = media(5);
+    let (_dir, path) = Ewf1Build {
+        compressed: false,
+        table2: true,
+        data_copy: true,
+    }
+    .write(&data);
+    let sectors = built_section(&path, "sectors");
+    // Two and a half stored chunks remain.
+    truncate(&path, sectors.data_offset + 5 * (CHUNK as u64 + 4) / 2);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::UnverifiedChunkTable,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(readable_chunks(&image, &data), 2);
+}
+
+#[test]
+fn locating_chunks_by_decoding_stops_at_a_damaged_chunk() {
+    let data = media(5);
+    let (_dir, path) = Ewf1Build {
+        table2: false,
+        ..Ewf1Build::libewf()
+    }
+    .write(&data);
+    let table = built_section(&path, "table");
+    let second_chunk = u64::from(get_u32(&path, ewf1_entry(&path, "table", 1)) & 0x7fff_ffff);
+    let sectors = built_section(&path, "sectors");
+    // Lose the table, and damage chunk 1: where chunk 2 starts is then unknown.
+    flip(&path, table.data_offset);
+    flip(&path, sectors.descriptor_offset + second_chunk + 10);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(readable_chunks(&image, &data), 1);
+    let gap = image
+        .lenient_findings()
+        .into_iter()
+        .find(|finding| finding.kind == IntegrityFindingKind::ChunksUnavailable)
+        .unwrap();
+    assert_eq!(gap.chunk_index, Some(1));
+}
+
+#[test]
+fn truncated_middle_segment_keeps_its_complete_chunks() {
+    let written = write_image(
+        "image.E01",
+        WriteFormat::Ewf1Physical,
+        WriteCompression::Zlib,
+        &media(24),
+        |options| options.maximum_segment_size = Some(12_000),
+    );
+    let image = Image::open(&written.path).unwrap();
+    assert!(image.number_of_segments() >= 3);
+    let second = image.segment_filename(1).unwrap().to_path_buf();
+    let in_second: Vec<u64> = (0..24)
+        .filter(|chunk| image.segment_filename_for_chunk(*chunk).unwrap() == second)
+        .collect();
+    assert!(in_second.len() >= 2, "{in_second:?}");
+    let sectors = ewf1_section(image.sections(), 1, "sectors");
+    drop(image);
+    truncate(&second, sectors.data_offset + sectors.data_size - 10);
+
+    let image = Image::open(&written.path).unwrap();
+    // Every chunk of the other segments, and all but the last chunk of the
+    // truncated segment, are readable; the last one fails.
+    assert_eq!(readable_chunks(&image, &written.data), 23);
+    let mut chunk = vec![0; CHUNK];
+    let last = *in_second.last().unwrap();
+    assert!(image.read_at(&mut chunk, last * CHUNK as u64).is_err());
 }
