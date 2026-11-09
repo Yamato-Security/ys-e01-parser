@@ -483,7 +483,11 @@ impl Image {
         expected_size: u64,
         committed_size: u64,
     ) -> Result<Self> {
-        let options = OpenOptions::default().with_chunk_cache_size(1);
+        // The checkpoint must describe exactly what was written, so damage is
+        // never gone past here.
+        let options = OpenOptions::default()
+            .with_strictness(OpenStrictness::Strict)
+            .with_chunk_cache_size(1);
         let statistics = Arc::new(ReaderStatisticsCollector::new(false));
         let segments =
             SegmentFilePool::new_path(paths.len(), options.maximum_open_handles(), statistics)?;

@@ -566,7 +566,12 @@ impl EwfWriter {
     /// represented by writer options.
     pub fn resume<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let image = Image::open(&path)?;
+        // Resuming rewrites the image in place, so it must not go past damage
+        // (and drop the metadata) the way lenient opening does.
+        let image = Image::open_with_options(
+            &path,
+            crate::OpenOptions::default().with_strictness(crate::OpenStrictness::Strict),
+        )?;
         let mut writer = Self::create_from_image(&path, &image)?;
         writer.options.media_size = None;
         writer.options.overwrite_existing = true;

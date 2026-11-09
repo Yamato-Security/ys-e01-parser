@@ -1235,3 +1235,15 @@ fn damaged_segment_number_still_fails_a_multi_segment_ewf1_image() {
     let error = Image::open(&written.path).unwrap_err();
     assert!(error.to_string().contains("segment number"), "{error}");
 }
+
+#[test]
+fn resuming_a_writer_does_not_go_past_damage() {
+    let written = e01(WriteCompression::Zlib, 2);
+    let digest = ewf1_section(&sections(&written.path), 0, "digest");
+    flip(&written.path, digest.data_offset + 3);
+
+    // Lenient opening would drop the digest; resuming rewrites the image, so
+    // it refuses instead.
+    assert!(Image::open(&written.path).is_ok());
+    assert!(EwfWriter::resume(&written.path).is_err());
+}
