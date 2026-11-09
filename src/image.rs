@@ -3764,11 +3764,7 @@ fn parse_ewf1_metadata_section(
 /// True when `data` starts like a zlib stream but does not decompress, which is
 /// how damage to a compressed metadata section shows.
 fn zlib_payload_is_damaged(data: &[u8]) -> bool {
-    let [cmf, flg, ..] = *data else {
-        return false;
-    };
-    let looks_like_zlib = cmf & 0x0f == 8 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0;
-    if !looks_like_zlib {
+    if !starts_like_zlib(data) {
         return false;
     }
     let mut decompressed = Vec::new();
@@ -6962,13 +6958,23 @@ fn ewf2_metadata_payload(
     data: &[u8],
     _compression_method: ewf2::CompressionMethod,
 ) -> Result<Vec<u8>> {
-    if data.first() == Some(&0x78) {
+    if starts_like_zlib(data) {
         return decompress_metadata(flate2::read::ZlibDecoder::new(data), "EWF2");
     }
     if data.starts_with(b"BZh") {
         return decompress_metadata(bzip2::read::BzDecoder::new(data), "EWF2");
     }
     Ok(data.to_vec())
+}
+
+/// A zlib stream header: deflate with a window of at most 32 KiB and a valid
+/// header check. Writers use smaller windows than the common 0x78 for short
+/// metadata (a 4 KiB window gives a first byte of 0x48, for example).
+fn starts_like_zlib(data: &[u8]) -> bool {
+    let [cmf, flg, ..] = *data else {
+        return false;
+    };
+    cmf & 0x0f == 8 && cmf >> 4 <= 7 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0
 }
 
 fn decode_ewf2_string_section(
@@ -7167,6 +7173,23 @@ mod tests {
             ewf1_metadata_payload(b"plain metadata", CompressionMethod::Zlib).unwrap(),
             b"plain metadata"
         );
+    }
+
+    #[test]
+    fn ewf2_metadata_payload_decompresses_zlib_data_with_a_small_window() {
+        // A 4 KiB window stream (header 0x48 ...), as EnCase 7 writes it.
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+        encoder.write_all(b"metadata").unwrap();
+        let mut stream = encoder.finish().unwrap();
+        stream[0] = 0x48;
+        stream[1] = (31 - (u16::from(stream[0]) << 8 | u16::from(stream[1] & 0xe0)) % 31) as u8
+            | (stream[1] & 0xe0);
+        assert!(starts_like_zlib(&stream));
+        assert_eq!(
+            ewf2_metadata_payload(&stream, ewf2::CompressionMethod::Zlib).unwrap(),
+            b"metadata"
+        );
+        assert!(!starts_like_zlib(&[0xff, 0xfe, 0x31, 0x00]));
     }
 
     #[test]
