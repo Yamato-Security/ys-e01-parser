@@ -96,15 +96,21 @@ include findings beyond that limit, and `suppressed_findings` reports how many
 were omitted. The optional `serde` feature serializes reports, findings,
 progress, recovery records, and section summaries.
 
-`analyze_path` first opens the image strictly. A structural failure while opening
-produces one typed finding and unavailable media coverage. Analysis does not
-resynchronize after a broken chain or enumerate every defect beyond it.
+`analyze_path` opens the image with the default options, which are lenient:
+structural damage that the image can still be checked without (a truncated
+segment, a damaged descriptor, media geometry or chunk table with an intact copy
+or checkable values, damaged hash or header metadata) is reported as findings
+ahead of the media results, and the chunks that cannot be verified are reported
+as unreadable. Lenient opening never substitutes data. An image that cannot be
+opened at all produces one typed finding and unavailable media coverage.
 Filesystem errors are returned as errors. Use `analyze_path_with_password` for
-encrypted inputs.
+encrypted inputs. Open with `OpenStrictness::Strict` and call `Image::analyze`
+to treat any structural defect as an opening failure instead.
 
 When analyzing an `Image` that is already open, analysis relies on the checks
 performed when the image was opened and does not revalidate every descriptor or
-metadata section. The report indicates whether the image was opened leniently.
+metadata section. The report starts with the defects that lenient opening went
+past, which `Image::lenient_findings` also returns.
 Table comparison checks only pairs with matching counts and base offsets, and
 `table2` ranges that differ are not treated as mirrors. Media progress begins
 after table comparison. Table comparison honors `signal_abort`.
