@@ -1259,3 +1259,56 @@ fn resuming_a_writer_does_not_go_past_damage() {
     assert!(Image::open(&written.path).is_ok());
     assert!(EwfWriter::resume(&written.path).is_err());
 }
+
+#[test]
+fn damaged_descriptor_next_offset_is_derived_from_its_size() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let volume = descriptor_offset(&written.path, 0, "volume");
+    modify(&written.path, |bytes| {
+        let next = usize::try_from(volume).unwrap() + 16;
+        bytes[next..next + 4].copy_from_slice(&[0; 4]);
+    });
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn segment_ending_inside_a_descriptor_keeps_the_sections_before_it() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let digest = descriptor_offset(&written.path, 0, "digest");
+    truncate(&written.path, digest + 30);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(kinds(&image), [IntegrityFindingKind::TruncatedSegment]);
+    assert_eq!(image.lenient_findings()[0].segment_offset, Some(digest));
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn analysis_of_a_damaged_image_reports_its_defects_and_unreadable_chunks() {
+    let written = e01(WriteCompression::Zlib, 4);
+    let sectors = ewf1_section(&sections(&written.path), 0, "sectors");
+    truncate(&written.path, sectors.data_offset + sectors.data_size / 2);
+
+    let report = ewf_image::analyze_path(&written.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(report.media_status, ewf_image::MediaScanStatus::Incomplete);
+    assert_eq!(report.bytes_verified, 2 * CHUNK as u64);
+    let found: Vec<_> = report
+        .findings
+        .iter()
+        .map(|finding| &finding.kind)
+        .collect();
+    assert_eq!(found[0], &IntegrityFindingKind::TruncatedSegment);
+    assert_eq!(
+        found
+            .iter()
+            .filter(|kind| ***kind == IntegrityFindingKind::ChunkUnreadable)
+            .count(),
+        2
+    );
+}
