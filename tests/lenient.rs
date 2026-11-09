@@ -916,3 +916,17 @@ fn damaged_ewf2_table_header_with_a_wrong_count_is_not_used() {
     );
     assert_eq!(readable_chunks(&image, &written.data), 0);
 }
+
+#[test]
+fn corruption_probes_report_damage_that_lenient_opening_goes_past() {
+    let written = e01(WriteCompression::Zlib, 3);
+    assert!(!ewf_image::check_file_corruption(&written.path).unwrap());
+    flip(
+        &written.path,
+        descriptor_offset(&written.path, 0, "sectors") + 40,
+    );
+
+    assert!(Image::open(&written.path).is_ok());
+    assert!(ewf_image::check_file_corruption(&written.path).unwrap());
+    assert!(ewf_image::check_segment_files_corruption([&written.path]).unwrap());
+}

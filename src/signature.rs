@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 
 use crate::format::{ewf1, ewf2};
 use crate::image::Image;
-use crate::{EwfError, Result};
+use crate::{EwfError, OpenOptions, OpenStrictness, Result};
+
+/// The corruption probes report any structural defect, so they open strictly
+/// even though lenient opening is the default.
+fn strict_options() -> OpenOptions {
+    OpenOptions::default().with_strictness(OpenStrictness::Strict)
+}
 
 /// Returns whether a file starts with a recognized EWF segment signature.
 ///
@@ -75,7 +81,9 @@ where
 
 /// Returns whether a single segment appears corrupt based on structural checks.
 ///
-/// Files without a recognized EWF signature return `false`. Unsupported but
+/// The checks are those of strict opening, so damage that lenient opening goes
+/// past still counts as corruption. Files without a recognized EWF signature
+/// return `false`. Unsupported but
 /// well-formed EWF features also return `false`; this helper is a corruption
 /// probe, not a full compatibility probe.
 ///
@@ -89,7 +97,7 @@ pub fn check_file_corruption(path: impl AsRef<Path>) -> Result<bool> {
         return Ok(false);
     }
 
-    match Image::open(path) {
+    match Image::open_with_options(path, strict_options()) {
         Err(EwfError::Malformed(message)) => Ok(malformed_error_is_corruption(&message)),
         Ok(_) | Err(EwfError::Unsupported(_) | EwfError::PasswordRequired) => Ok(false),
         Err(err) => Err(err),
@@ -98,6 +106,7 @@ pub fn check_file_corruption(path: impl AsRef<Path>) -> Result<bool> {
 
 /// Returns whether a segment set appears corrupt based on structural checks.
 ///
+/// The checks are those of strict opening, as for [`check_file_corruption`].
 /// Segment sets with no recognized EWF signatures return `false`.
 ///
 /// # Errors
@@ -119,7 +128,7 @@ where
         return Ok(false);
     }
 
-    match Image::open_segments(paths) {
+    match Image::open_segments_with_options(paths, strict_options()) {
         Err(EwfError::Malformed(message)) => Ok(malformed_error_is_corruption(&message)),
         Ok(_) | Err(EwfError::Unsupported(_) | EwfError::PasswordRequired) => Ok(false),
         Err(err) => Err(err),
