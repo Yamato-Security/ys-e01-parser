@@ -597,6 +597,9 @@ impl Image {
         // section chain stopped early, later segments wait in `unplaced_ewf1`.
         let mut ewf1_positions_known = true;
         let mut unplaced_ewf1 = Vec::new();
+        // Set while the first segment's media geometry comes from a damaged
+        // section that no intact copy has confirmed yet.
+        let mut ewf1_geometry_unverified: Option<String> = None;
         let mut expected_set_identifier: Option<[u8; 16]> = None;
         let mut expected_ewf1_media = None;
         let mut expected_ewf1_compression_method = None;
@@ -677,6 +680,12 @@ impl Image {
                     ));
                 }
                 expected_ewf1_media.get_or_insert(observed);
+                if segment_index == 0 {
+                    ewf1_geometry_unverified.clone_from(&parsed.ewf1_geometry_unverified);
+                } else if parsed.ewf1_geometry_unverified.is_none() {
+                    // An intact later copy agrees with the first segment's.
+                    ewf1_geometry_unverified = None;
+                }
             }
             validate_ewf2_header_profile(
                 &mut expected_ewf2_header_profile,
@@ -797,7 +806,7 @@ impl Image {
                 .transpose()?;
             place_ewf1_segments_from_end(
                 unplaced_ewf1,
-                total_chunks.filter(|_| acquisition_complete),
+                total_chunks.filter(|_| acquisition_complete && ewf1_geometry_unverified.is_none()),
                 next_ewf1_chunk,
                 &mut ranges,
                 &mut leniency,
@@ -827,6 +836,14 @@ impl Image {
                 0
             };
             media.chunk_count = Some(discovered_table_chunks.max(media_chunks));
+        }
+        if let Some(reason) = ewf1_geometry_unverified {
+            check_unverified_ewf1_geometry(
+                &reason,
+                expected_ewf1_media,
+                ewf1_positions_known,
+                discovered_table_chunks,
+            )?;
         }
         if let Some((expected_size, committed_size)) = acquisition_prefix {
             if format != Format::Ewf1
@@ -2911,6 +2928,10 @@ struct ParsedSegment {
     /// EWF1: the section chain was followed to its end, so `table_chunk_count`
     /// is the segment's chunk count rather than a lower bound.
     ewf1_chain_complete: bool,
+    /// EWF1: why the media geometry is unverified, when lenient opening used a
+    /// damaged copy tentatively; it must then agree with the rest of the image.
+    /// `None` when it came from an intact section (or there was none).
+    ewf1_geometry_unverified: Option<String>,
     metadata: EwfMetadata,
     stored_hashes: StoredHashes,
     acquisition_errors: Vec<AcquisitionError>,
@@ -2948,6 +2969,34 @@ struct Ewf1MediaGeometry {
 struct Ewf1SegmentContext {
     first_chunk: u64,
     inherited_media_geometry: Option<Ewf1MediaGeometry>,
+}
+
+/// Accepts media geometry read from a damaged section only when the image
+/// confirms it: every segment's tables were read and together hold exactly the
+/// declared chunk count, the media fills its last chunk (so no low bit of the
+/// sector count can be wrong unnoticed), and the sector and chunk counts agree.
+fn check_unverified_ewf1_geometry(
+    reason: &str,
+    geometry: Option<Ewf1MediaGeometry>,
+    all_tables_read: bool,
+    table_chunks: u64,
+) -> Result<()> {
+    let confirmed = geometry.is_some_and(|geometry| {
+        let full_chunks = u64::from(geometry.chunk_count)
+            .checked_mul(geometry.chunk_size)
+            .is_some_and(|size| size == geometry.logical_size);
+        let sane = geometry.bytes_per_sector.is_power_of_two()
+            && geometry.bytes_per_sector <= 4096
+            && geometry.sectors_per_chunk.is_power_of_two();
+        all_tables_read && sane && full_chunks && table_chunks == u64::from(geometry.chunk_count)
+    });
+    if confirmed {
+        Ok(())
+    } else {
+        Err(EwfError::Malformed(format!(
+            "{reason}; no intact copy exists and the chunk tables do not confirm its values"
+        )))
+    }
 }
 
 /// An EWF1 segment parsed after a segment whose chunk count is unknown. Its
@@ -3060,20 +3109,8 @@ fn parse_ewf1_segment(
     let chain_complete = chain.complete;
     let sections = chain.sections;
     let compression_method = detect_ewf1_compression_method(file_header, &sections)?;
-    let volume = sections
-        .iter()
-        .find(|section| {
-            matches!(
-                section.desc.section_type.as_str(),
-                "volume" | "disk" | "data"
-            )
-        })
-        .map(|section| {
-            let data = read_exact_at(file, section.data_offset, section.data_size)?;
-            validate_present_ewf1_media_checksum(&data, &section.desc.section_type)?;
-            ewf1::Volume::parse(&data)
-        })
-        .transpose()?;
+    let (volume, unverified_geometry) =
+        select_ewf1_volume(file, &sections, segment_index, leniency)?;
     if segment_index == 0 && volume.is_none() {
         return Err(EwfError::Malformed("missing EWF1 media section".into()));
     }
@@ -3263,6 +3300,7 @@ fn parse_ewf1_segment(
         ranges,
         table_chunk_count,
         ewf1_chain_complete: chain_complete,
+        ewf1_geometry_unverified: unverified_geometry,
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -3418,6 +3456,132 @@ fn zlib_payload_is_damaged(data: &[u8]) -> bool {
         .take(MAX_DECOMPRESSED_METADATA + 1)
         .read_to_end(&mut decompressed)
         .is_err()
+}
+
+/// Largest EWF1 media section read; volume, disk and data sections are 94 or
+/// 1052 bytes, so a larger one is damaged.
+const EWF1_MAXIMUM_MEDIA_SECTION_SIZE: u64 = 64 * 1024;
+
+/// Chooses the media geometry of an EWF1 segment from its volume, disk or data
+/// sections. Strict opening validates the first one. Lenient opening uses the
+/// first intact copy (EWF1 writes the same values to `volume` and `data`). When
+/// every copy is damaged, a continuation segment's copy is ignored, and the first
+/// segment's is used tentatively and returned with the reason it is unverified,
+/// so that the caller checks it against the chunk tables and any intact copy.
+fn select_ewf1_volume(
+    file: &mut dyn SegmentReader,
+    sections: &[Section],
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<(Option<ewf1::Volume>, Option<String>)> {
+    let mut damaged: Vec<ewf1::Volume> = Vec::new();
+    let mut first_error = None;
+    for section in sections.iter().filter(|section| {
+        matches!(
+            section.desc.section_type.as_str(),
+            "volume" | "disk" | "data"
+        )
+    }) {
+        let label = format!("EWF1 {}", section.desc.section_type);
+        let checked =
+            if leniency.is_lenient() && section.data_size > EWF1_MAXIMUM_MEDIA_SECTION_SIZE {
+                Err((
+                    EwfError::Malformed(format!("{label} section is too large")),
+                    None,
+                ))
+            } else {
+                let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                match validate_present_ewf1_media_checksum(&data, &section.desc.section_type) {
+                    Ok(()) => Ok(data),
+                    Err(error) => Err((error, Some(data))),
+                }
+            };
+        match checked {
+            Ok(data) => {
+                let volume = ewf1::Volume::parse(&data)?;
+                if let Some((error, offset)) = first_error {
+                    leniency.tolerate(
+                        error,
+                        DefectKind::ChecksumMismatch,
+                        segment_index,
+                        offset,
+                        &format!(
+                            "the intact copy in the {} section was used",
+                            section.desc.section_type
+                        ),
+                    )?;
+                }
+                return Ok((Some(volume), None));
+            }
+            Err((error, data)) => {
+                if !leniency.is_lenient() {
+                    return Err(error);
+                }
+                if let Some(volume) = data
+                    .as_deref()
+                    .and_then(|data| ewf1::Volume::parse(data).ok())
+                {
+                    damaged.push(volume);
+                }
+                first_error.get_or_insert((error, section.desc.offset));
+            }
+        }
+    }
+    let Some((error, offset)) = first_error else {
+        return Ok((None, None));
+    };
+    if segment_index > 0 {
+        leniency.tolerate(
+            error,
+            DefectKind::ChecksumMismatch,
+            segment_index,
+            offset,
+            "this segment's copy of the media geometry is not used",
+        )?;
+        return Ok((None, None));
+    }
+    let same_geometry = |left: &ewf1::Volume, right: &ewf1::Volume| {
+        (
+            left.chunk_count,
+            left.sectors_per_chunk,
+            left.bytes_per_sector,
+            left.sector_count,
+            left.smart,
+        ) == (
+            right.chunk_count,
+            right.sectors_per_chunk,
+            right.bytes_per_sector,
+            right.sector_count,
+            right.smart,
+        )
+    };
+    let Some(volume) = damaged
+        .first()
+        .filter(|first| damaged.iter().all(|other| same_geometry(first, other)))
+    else {
+        return Err(error);
+    };
+    let reason = crate::lenient::describe(&error);
+    leniency.tolerate(
+        error,
+        DefectKind::ChecksumMismatch,
+        segment_index,
+        offset,
+        "no intact copy exists, so its geometry is used only because it agrees with the \
+         chunk tables and with any intact copy in a later segment; its other values are not used",
+    )?;
+    // Only the geometry is checked later; the remaining fields stay unknown.
+    Ok((
+        Some(ewf1::Volume {
+            set_identifier: None,
+            media_type: None,
+            media_flags: None,
+            compression_level: None,
+            error_granularity: None,
+            ..*volume
+        }),
+        Some(reason),
+    ))
 }
 
 fn ewf1_media_type(value: u8) -> MediaType {
@@ -3864,6 +4028,7 @@ fn parse_ewf2_segment(
         ranges,
         table_chunk_count,
         ewf1_chain_complete: true,
+        ewf1_geometry_unverified: None,
         metadata,
         stored_hashes,
         acquisition_errors,

@@ -514,3 +514,197 @@ fn damaged_descriptor_with_inconsistent_offsets_stops_the_segment() {
     assert_eq!(image.lenient_findings()[0].segment_offset, Some(table));
     assert_eq!(readable_chunks(&image, &written.data), 0);
 }
+
+/// A single EWF1 segment laid out the way the common writers lay it out:
+/// volume, sectors, table, table2, a data copy of the volume, and done. Compressed
+/// chunks are zlib streams; raw chunks carry their Adler-32.
+struct Ewf1Build {
+    compressed: bool,
+    table2: bool,
+    data_copy: bool,
+}
+
+impl Ewf1Build {
+    const fn libewf() -> Self {
+        Self {
+            compressed: true,
+            table2: true,
+            data_copy: true,
+        }
+    }
+
+    fn write(&self, media: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("built.E01");
+        std::fs::write(&path, self.bytes(media)).unwrap();
+        (dir, path)
+    }
+
+    fn bytes(&self, media: &[u8]) -> Vec<u8> {
+        assert_eq!(media.len() % 512, 0);
+        let chunks: Vec<Vec<u8>> = media
+            .chunks(CHUNK)
+            .map(|chunk| {
+                if self.compressed {
+                    let mut encoder =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(chunk).unwrap();
+                    encoder.finish().unwrap()
+                } else {
+                    let mut raw = chunk.to_vec();
+                    raw.extend(adler32(chunk).to_le_bytes());
+                    raw
+                }
+            })
+            .collect();
+        let mut volume = vec![0_u8; 1052];
+        volume[0] = 1;
+        volume[4..8].copy_from_slice(&u32::try_from(chunks.len()).unwrap().to_le_bytes());
+        volume[8..12].copy_from_slice(&64_u32.to_le_bytes());
+        volume[12..16].copy_from_slice(&512_u32.to_le_bytes());
+        volume[16..24].copy_from_slice(&(media.len() as u64 / 512).to_le_bytes());
+        volume[64..80].copy_from_slice(&[0x5e; 16]);
+        let checksum = adler32(&volume[..1048]);
+        volume[1048..].copy_from_slice(&checksum.to_le_bytes());
+
+        let mut bytes = b"EVF\x09\x0d\x0a\xff\x00\x01\x01\x00\x00\x00".to_vec();
+        let section = |bytes: &mut Vec<u8>, kind: &[u8], payload: &[u8]| {
+            let offset = bytes.len() as u64;
+            let size = 76 + payload.len() as u64;
+            bytes.extend(descriptor(kind, offset + size, size));
+            bytes.extend(payload);
+        };
+        section(&mut bytes, b"volume", &volume);
+        let sectors_offset = bytes.len() as u64;
+        let mut sectors = Vec::new();
+        let mut entries = Vec::new();
+        for chunk in &chunks {
+            let relative = u32::try_from(76 + sectors.len()).unwrap();
+            entries
+                .extend((relative | if self.compressed { 0x8000_0000 } else { 0 }).to_le_bytes());
+            sectors.extend(chunk);
+        }
+        section(&mut bytes, b"sectors", &sectors);
+        let mut table = vec![0_u8; 24];
+        table[0..4].copy_from_slice(&u32::try_from(chunks.len()).unwrap().to_le_bytes());
+        table[8..16].copy_from_slice(&sectors_offset.to_le_bytes());
+        let checksum = adler32(&table[..20]);
+        table[20..24].copy_from_slice(&checksum.to_le_bytes());
+        table.extend(&entries);
+        table.extend(adler32(&entries).to_le_bytes());
+        section(&mut bytes, b"table", &table);
+        if self.table2 {
+            section(&mut bytes, b"table2", &table);
+        }
+        if self.data_copy {
+            section(&mut bytes, b"data", &volume);
+        }
+        let done = bytes.len() as u64;
+        bytes.extend(descriptor(b"done", done, 76));
+        bytes
+    }
+}
+
+fn built_section(path: &Path, name: &str) -> SectionInfo {
+    ewf1_section(&sections(path), 0, name)
+}
+
+fn read_all(image: &Image) -> Vec<u8> {
+    let mut buffer = vec![0; usize::try_from(image.media_size()).unwrap()];
+    assert_eq!(image.read_at(&mut buffer, 0).unwrap(), buffer.len());
+    buffer
+}
+
+#[test]
+fn damaged_volume_uses_the_intact_data_copy() {
+    let data = media(3);
+    let (_dir, path) = Ewf1Build::libewf().write(&data);
+    let volume = built_section(&path, "volume");
+    // The sector count: the damaged copy would make the media shorter.
+    flip(&path, volume.data_offset + 16);
+
+    assert!(open_strict(&path).is_err());
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert!(image.lenient_findings()[0].message.contains("data section"));
+    assert_eq!(image.media_size(), data.len() as u64);
+    assert_eq!(image.segment_file_set_identifier(), Some([0x5e; 16]));
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn damaged_volume_without_a_copy_is_checked_against_the_tables() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let volume = ewf1_section(&sections(&written.path), 0, "volume");
+    // A byte outside the geometry fields.
+    flip(&written.path, volume.data_offset + 300);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    // Values the image cannot confirm are not reported.
+    assert_eq!(image.media_type(), None);
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn damaged_volume_geometry_without_a_copy_is_refused() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let volume = ewf1_section(&sections(&written.path), 0, "volume");
+    // The lowest bit of the sector count: the chunk count still agrees, but
+    // the media would no longer fill its last chunk.
+    flip(&written.path, volume.data_offset + 16);
+
+    let error = Image::open(&written.path).unwrap_err();
+    assert!(
+        error.to_string().contains("EWF1 volume checksum mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn damaged_media_copy_in_a_continuation_segment_is_ignored() {
+    let written = multi_segment_e01();
+    let image = Image::open(&written.path).unwrap();
+    let third = image.segment_filename(2).unwrap().to_path_buf();
+    let volume = ewf1_section(image.sections(), 2, "volume");
+    drop(image);
+    flip(&third, volume.data_offset + 4);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(image.lenient_findings()[0].segment_index, Some(2));
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn damaged_first_volume_is_confirmed_by_a_later_copy() {
+    // The media does not fill its last chunk, so only an intact copy can
+    // confirm the sector count.
+    let mut data = media(9);
+    data.truncate(data.len() - 4096);
+    let written = write_image(
+        "image.E01",
+        WriteFormat::Ewf1Physical,
+        WriteCompression::None,
+        &data,
+        |options| options.maximum_segment_size = Some(70_000),
+    );
+    let volume = ewf1_section(&sections(&written.path), 0, "volume");
+    flip(&written.path, volume.data_offset + 500);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), data);
+}
