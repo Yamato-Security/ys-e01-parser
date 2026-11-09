@@ -4755,8 +4755,14 @@ fn scan_ewf2_leading_sections_lenient(
         };
         if let Err(error) = intact {
             // The first section decides the layout; a damaged one is not taken
-            // as evidence of a leading layout.
-            if sections.is_empty() || matches!(desc.section_type, ewf2::SectionType::Unknown(_)) {
+            // as evidence of a leading layout. A later one is followed only when
+            // its sizes lead to an intact descriptor (or it ends the chain).
+            let leads_on = is_terminal_ewf2_section(desc.section_type)
+                || intact_ewf2_descriptor_at(file, next_offset, file_len)?;
+            if sections.is_empty()
+                || matches!(desc.section_type, ewf2::SectionType::Unknown(_))
+                || !leads_on
+            {
                 return stop(
                     sections,
                     leniency,
@@ -4769,7 +4775,7 @@ fn scan_ewf2_leading_sections_lenient(
                 DefectKind::ChecksumMismatch,
                 segment_index,
                 offset,
-                "its sizes are consistent, so the chain was followed",
+                "its sizes lead to an intact descriptor, so the chain was followed",
             )?;
         }
         if next_offset > file_len {
@@ -4799,6 +4805,24 @@ fn scan_ewf2_leading_sections_lenient(
         }
         offset = next_offset;
     }
+}
+
+/// True when an EWF2 descriptor with a stored, matching checksum starts at `offset`.
+fn intact_ewf2_descriptor_at(
+    file: &mut dyn SegmentReader,
+    offset: u64,
+    file_len: u64,
+) -> Result<bool> {
+    let descriptor_size = ewf2::SECTION_DESCRIPTOR_SIZE as u64;
+    if offset
+        .checked_add(descriptor_size)
+        .is_none_or(|end| end > file_len)
+    {
+        return Ok(false);
+    }
+    let bytes = read_exact_at(file, offset, descriptor_size)?;
+    let stored = u32::from_le_bytes(read_array(&bytes, 60)?);
+    Ok(stored != 0 && bytes.get(..60).map(adler32) == Some(stored))
 }
 
 /// Lenient form of [`scan_ewf2_trailing_sections`]. The chain is walked back

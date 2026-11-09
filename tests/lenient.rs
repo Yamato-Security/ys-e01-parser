@@ -1312,3 +1312,101 @@ fn analysis_of_a_damaged_image_reports_its_defects_and_unreadable_chunks() {
         2
     );
 }
+
+/// A single EWF2 segment whose descriptors precede their data.
+fn build_ex01_leading(media: &[u8]) -> (tempfile::TempDir, PathBuf, Vec<u64>) {
+    fn descriptor(kind: u32, data_size: u64, previous: u64) -> [u8; 64] {
+        let mut bytes = [0_u8; 64];
+        bytes[0..4].copy_from_slice(&kind.to_le_bytes());
+        bytes[8..16].copy_from_slice(&previous.to_le_bytes());
+        bytes[16..24].copy_from_slice(&data_size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&64_u32.to_le_bytes());
+        let checksum = adler32(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+    let mut bytes = b"EVF2\x0d\x0a\x81\x00\x02\x01\x01\x00\x01\x00\x00\x00".to_vec();
+    bytes.extend([0x3c; 16]);
+    let mut offsets = Vec::new();
+    let mut previous = 0;
+    let mut section = |bytes: &mut Vec<u8>, kind: u32, data: &[u8]| {
+        let offset = bytes.len() as u64;
+        offsets.push(offset);
+        bytes.extend(descriptor(kind, data.len() as u64, previous));
+        bytes.extend(data);
+        previous = offset;
+        bytes.len() as u64
+    };
+    let text: Vec<u8> = "1\nmain\nbp\tsb\tts\n512\t64\t192\n\n"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let sector_data_start = section(&mut bytes, 0x01, &text) + 64;
+    let mut sector_data = Vec::new();
+    let mut entries = Vec::new();
+    for chunk in media.chunks(CHUNK) {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(chunk).unwrap();
+        let stream = encoder.finish().unwrap();
+        entries.extend((sector_data_start + sector_data.len() as u64).to_le_bytes());
+        entries.extend(u32::try_from(stream.len()).unwrap().to_le_bytes());
+        entries.extend(1_u32.to_le_bytes());
+        sector_data.extend(stream);
+    }
+    section(&mut bytes, 0x03, &sector_data);
+    let mut table = vec![0_u8; 32];
+    table[8..12].copy_from_slice(
+        &u32::try_from(media.len().div_ceil(CHUNK))
+            .unwrap()
+            .to_le_bytes(),
+    );
+    let checksum = adler32(&table[..16]);
+    table[16..20].copy_from_slice(&checksum.to_le_bytes());
+    table.extend(&entries);
+    let mut footer = [0_u8; 16];
+    footer[..4].copy_from_slice(&adler32(&entries).to_le_bytes());
+    table.extend(footer);
+    section(&mut bytes, 0x04, &table);
+    section(&mut bytes, 0x0f, &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leading.Ex01");
+    std::fs::write(&path, bytes).unwrap();
+    (dir, path, offsets)
+}
+
+#[test]
+fn damaged_leading_ewf2_descriptor_is_followed_when_it_leads_to_an_intact_one() {
+    let data = media(3);
+    let (_dir, path, descriptors) = build_ex01_leading(&data);
+    assert_eq!(read_all(&Image::open(&path).unwrap()), data);
+    // A padding byte of the sector data descriptor.
+    flip(&path, descriptors[1] + 50);
+
+    assert!(open_strict(&path).is_err());
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn damaged_leading_ewf2_descriptor_with_a_wrong_size_ends_the_chain() {
+    let data = media(3);
+    let (_dir, path, descriptors) = build_ex01_leading(&data);
+    // The sector data size: the next descriptor is no longer where it points.
+    flip(&path, descriptors[1] + 17);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(image.media_size(), data.len() as u64);
+    assert_eq!(readable_chunks(&image, &data), 0);
+}
