@@ -24,6 +24,15 @@ imported with its history. (@YamatoSecurity)
 
 ### Fixed
 
+- Damaged EWF1/EWF2 table entries could select another intact chunk and return
+  its bytes successfully. Reads now reject mappings whose table checksum failed
+  unless an intact replacement table exists. Payload checksums alone cannot
+  authenticate a chunk's logical position. (@YamatoSecurity)
+- Padded raw final chunks now validate the checksum over the entire stored
+  payload before returning the media prefix, reject corrupt payloads and
+  checksum trailers, and report the dropped padding. (@YamatoSecurity)
+- Writer documentation examples respect the optional `writer` feature, so
+  default and minimal reader-only doctests compile. (@YamatoSecurity)
 - An image whose last chunk decodes to more bytes than the media needs, as some writers store it,
   failed to open; the media's bytes are read and an `OverlongChunk` warning is recorded.
   (@YamatoSecurity)

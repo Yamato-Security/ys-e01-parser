@@ -772,6 +772,7 @@ fn parse_candidate(
             ewf1_compression_method: Some(CompressionMethod::Zlib),
             ewf2_compression_method: None,
             entries_verified: trusted_table,
+            mapping_unverified: !trusted_table,
             data_start: Some(sectors.data_offset),
         },
         data_start: sectors.data_offset,

@@ -106,7 +106,11 @@
 //!
 //! # Writing
 //!
+//! Enable the `writer` feature to use these APIs.
+//!
 //! ```no_run
+//! # #[cfg(feature = "writer")]
+//! # mod example {
 //! use std::fs::File;
 //!
 //! fn main() -> ewf_image::Result<()> {
@@ -123,6 +127,7 @@
 //!
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Streaming acquisition
@@ -133,6 +138,8 @@
 //! links.
 //!
 //! ```no_run
+//! # #[cfg(feature = "writer")]
+//! # mod example {
 //! use std::fs::File;
 //! use std::ops::ControlFlow;
 //! use ewf_image::{AcquisitionOptions, AcquisitionReadOptions, AcquisitionStatus, AcquisitionWriter};
@@ -155,6 +162,7 @@
 //!     }
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Feature flags

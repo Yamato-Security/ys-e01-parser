@@ -101,7 +101,12 @@ structural damage that the image can still be checked without (a truncated
 segment, a damaged descriptor, media geometry or chunk table with an intact copy
 or checkable values, damaged hash or header metadata) is reported as findings
 ahead of the media results, and the chunks that cannot be verified are reported
-as unreadable. Lenient opening never substitutes data. An image that cannot be
+as unreadable. If a table's entries checksum fails and no intact copy exists,
+all reads through that table fail: an intact payload checksum does not establish
+the chunk's logical position. This also applies to the remaining entries of a
+truncated EWF2 table whose checksum was lost. Trusted tables elsewhere in the
+image, intact EWF1 `table2` copies, and sequentially verified EWF1 carving remain
+usable. Lenient opening never substitutes data. An image that cannot be
 opened at all produces one typed finding and unavailable media coverage.
 Filesystem errors are returned as errors. Use `analyze_path_with_password` for
 encrypted inputs. Open with `OpenStrictness::Strict` and call `Image::analyze`

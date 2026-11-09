@@ -92,9 +92,9 @@ pub(crate) fn decode_chunk_with_decoded_length(
 }
 
 /// Decodes a zlib chunk that must verify itself: the stream has to end, with
-/// its Adler-32 matching, exactly at the end of `encoded`. Used for chunks whose
-/// table entry is unverified, where a damaged offset or size must not yield
-/// another stream's bytes.
+/// its Adler-32 matching, exactly at the end of `encoded`. Used for sequentially
+/// carved chunks or damaged sector data. This verifies the stored payload,
+/// not the logical position assigned to it by a table.
 pub(crate) fn decode_zlib_exact(
     encoded: &[u8],
     logical_size: usize,

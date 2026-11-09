@@ -120,8 +120,6 @@ struct ImageInner {
     defects: Vec<Defect>,
     #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     read_defects: Mutex<Vec<Defect>>,
-    /// Chunks of unverified EWF2 tables whose entries are inconsistent, sorted.
-    rejected_chunks: Vec<u64>,
     /// Runs of EWF1 chunks located by decoding them in sequence, for segments
     /// whose table was lost; `TableRangeKind::Ewf1Carved` ranges index them.
     carved_chunks: Vec<Vec<CarvedChunk>>,
@@ -631,7 +629,6 @@ impl Image {
         // section that no intact copy has confirmed yet.
         let mut ewf1_geometry_unverified: Option<String> = None;
         let mut ewf2_next_chunk = 0_u64;
-        let mut rejected_chunks = Vec::new();
         let mut carved_chunks = Vec::new();
         let mut expected_set_identifier: Option<[u8; 16]> = None;
         let mut expected_ewf1_media = None;
@@ -826,7 +823,6 @@ impl Image {
                 acquisition_complete = parsed.acquisition_complete;
             }
             merge_hashes(&mut stored_hashes, &parsed.stored_hashes)?;
-            rejected_chunks.extend(parsed.rejected_chunks);
             if parsed.format == Format::Ewf2 {
                 for range in &parsed.ranges {
                     ewf2_next_chunk =
@@ -863,6 +859,7 @@ impl Image {
                         ewf1_compression_method: None,
                         ewf2_compression_method: None,
                         entries_verified: false,
+                        mapping_unverified: false,
                         data_start: None,
                     });
                     carved_chunks.push(parsed.ewf1_carved);
@@ -1035,11 +1032,6 @@ impl Image {
                 checksum_errors: Mutex::new(Vec::new()),
                 defects: leniency.into_defects(),
                 read_defects: Mutex::new(Vec::new()),
-                rejected_chunks: {
-                    rejected_chunks.sort_unstable();
-                    rejected_chunks.dedup();
-                    rejected_chunks
-                },
                 carved_chunks,
                 read_zero_chunk_on_error: AtomicBool::new(options.read_zero_chunk_on_error()),
                 abort_signaled: AtomicBool::new(false),
@@ -1086,6 +1078,7 @@ impl Image {
         match chunk.encoding {
             ChunkEncoding::Raw => {
                 chunk.validate_checksum
+                    && encoded.len() == chunk.logical_size.saturating_add(4)
                     && validate_raw_chunk_checksum(&encoded, chunk.logical_size).is_ok()
             }
             ChunkEncoding::Zlib => {
@@ -2076,6 +2069,11 @@ impl Image {
 
     fn lookup_chunk(&self, chunk_id: u64) -> Result<Chunk> {
         let (_, range) = self.inner.index.range_index_for(chunk_id)?;
+        if range.mapping_unverified {
+            return Err(EwfError::Malformed(format!(
+                "chunk {chunk_id} has no verified logical mapping: its table checksum failed"
+            )));
+        }
         let local_index = chunk_id
             .checked_sub(range.first_chunk)
             .ok_or_else(|| EwfError::Malformed("chunk range underflow".into()))?;
@@ -2189,10 +2187,11 @@ impl Image {
             logical_size,
             encoding,
             validate_checksum: encoding == ChunkEncoding::Raw
-                && u64::try_from(logical_size)
+                && (u64::try_from(logical_size)
                     .ok()
                     .and_then(|size| size.checked_add(4))
-                    == Some(encoded_size),
+                    == Some(encoded_size)
+                    || raw_chunk_size_cap(self.inner.info.chunk_size)? == encoded_size),
             self_verify,
         })
     }
@@ -2230,13 +2229,6 @@ impl Image {
         let validate_checksum = matches!(encoding, ChunkEncoding::Raw)
             && entry.flags & ewf2::CHUNK_FLAG_HAS_CHECKSUM != 0;
         let self_verify = !range.entries_verified;
-        let chunk_id = range.first_chunk.saturating_add(local_index);
-        if self_verify && self.inner.rejected_chunks.binary_search(&chunk_id).is_ok() {
-            return Err(EwfError::Malformed(format!(
-                "unverified EWF2 table entry of chunk {chunk_id} overlaps another entry or \
-                 points outside the sector data"
-            )));
-        }
         validate_encoded_size(
             u64::from(entry.chunk_data_size),
             self.inner.info.chunk_size,
@@ -2499,9 +2491,23 @@ impl Image {
         } else {
             chunk.logical_size
         };
-        let (decoded, decoded_length) = if chunk.self_verify
-            && chunk.encoding == ChunkEncoding::Zlib
-        {
+        let (decoded, decoded_length) = if chunk.encoding == ChunkEncoding::Raw {
+            // The trailer belongs to the entire stored payload, including any
+            // final-chunk padding, rather than just the logical media prefix.
+            let payload_length = encoded.len() - usize::from(chunk.validate_checksum) * 4;
+            if payload_length > maximum_decoded_size {
+                return Err(EwfError::Malformed(format!(
+                    "raw chunk has {payload_length} bytes, expected at most {maximum_decoded_size}"
+                )));
+            }
+            let (decoded, _) = decode_chunk_with_decoded_length(
+                &encoded[..payload_length],
+                chunk.encoding,
+                chunk.logical_size,
+                maximum_decoded_size,
+            )?;
+            (decoded, payload_length)
+        } else if chunk.self_verify && chunk.encoding == ChunkEncoding::Zlib {
             let decoded = decode_zlib_exact(&encoded, chunk.logical_size, maximum_decoded_size)?;
             (decoded, chunk.logical_size)
         } else {
@@ -3141,8 +3147,6 @@ struct ParsedSegment {
     /// damaged copy tentatively; it must then agree with the rest of the image.
     /// `None` when it came from an intact section (or there was none).
     ewf1_geometry_unverified: Option<String>,
-    /// EWF2: chunks of unverified tables whose entries are inconsistent.
-    rejected_chunks: Vec<u64>,
     metadata: EwfMetadata,
     stored_hashes: StoredHashes,
     acquisition_errors: Vec<AcquisitionError>,
@@ -3746,7 +3750,6 @@ fn parse_ewf1_segment(
         ewf1_chain_complete: chain_complete && ranges_complete,
         ewf1_carved: carved,
         ewf1_geometry_unverified: unverified_geometry,
-        rejected_chunks: Vec::new(),
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -4428,10 +4431,7 @@ fn parse_ewf2_segment(
         chunk_size = 32_768;
     }
     validate_chunk_size(chunk_size)?;
-    let Ewf2Ranges {
-        ranges,
-        rejected_chunks,
-    } = parse_ewf2_ranges(
+    let ranges = parse_ewf2_ranges(
         file,
         &sections,
         Ewf2RangeContext {
@@ -4506,7 +4506,6 @@ fn parse_ewf2_segment(
         ewf1_chain_complete: true,
         ewf1_carved: Vec::new(),
         ewf1_geometry_unverified: None,
-        rejected_chunks,
         metadata,
         stored_hashes,
         acquisition_errors,
@@ -6141,8 +6140,8 @@ fn parse_ewf1_ranges(
                     DefectKind::UnverifiedChunkTable,
                     segment_index,
                     section.desc.offset,
-                    "no intact copy exists, so each of its chunks is returned only when the \
-                     chunk's own checksum verifies it",
+                    "no intact copy exists; payload checksums cannot establish logical chunk \
+                     positions, so reads through this table fail",
                 )?;
                 entries_verified = false;
             }
@@ -6188,6 +6187,7 @@ fn parse_ewf1_ranges(
             ewf1_compression_method: Some(profile.compression_method),
             ewf2_compression_method: None,
             entries_verified,
+            mapping_unverified: !entries_verified,
             data_start: Some(data_start),
         });
         next_chunk = next_chunk
@@ -6226,14 +6226,6 @@ fn sectors_section_contains_offset(section: &Section, offset: u64) -> bool {
         .is_some_and(|data_end| offset >= section.data_offset && offset <= data_end)
 }
 
-/// A segment's EWF2 table ranges.
-struct Ewf2Ranges {
-    ranges: Vec<TableRange>,
-    /// Chunks of unverified tables whose entries overlap another entry or point
-    /// outside the segment's sector data; reading them fails.
-    rejected_chunks: Vec<u64>,
-}
-
 /// The position of an EWF2 segment's tables in the media.
 #[derive(Clone, Copy)]
 struct Ewf2RangeContext {
@@ -6251,7 +6243,7 @@ fn parse_ewf2_ranges(
     context: Ewf2RangeContext,
     leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
-) -> Result<Ewf2Ranges> {
+) -> Result<Vec<TableRange>> {
     const NOT_USED: &str = "the table is not used, so its chunks fail when read";
     let Ewf2RangeContext {
         segment_index,
@@ -6259,23 +6251,12 @@ fn parse_ewf2_ranges(
         expected_first_chunk,
         compression_method,
     } = context;
-    let sector_data: Vec<(u64, u64)> = sections
-        .iter()
-        .filter(|section| section.desc.section_type == ewf2::SectionType::SectorData)
-        .map(|section| {
-            (
-                section.data_offset,
-                section.data_offset.saturating_add(section.data_size),
-            )
-        })
-        .collect();
     // Sector data whose integrity hash failed may hold damaged chunks: each
     // must verify itself.
     let segment_data_damaged = sections.iter().any(|section| {
         section.damaged_data && section.desc.section_type == ewf2::SectionType::SectorData
     });
     let mut ranges = Vec::new();
-    let mut rejected_chunks = Vec::new();
     let mut expected_next = expected_first_chunk;
     for section in sections
         .iter()
@@ -6420,6 +6401,7 @@ fn parse_ewf2_ranges(
         } else {
             entries_check
         };
+        let mapping_unverified = entries_check.is_err();
         let entries_verified = match entries_check {
             Ok(()) if !segment_data_damaged => true,
             Ok(()) => false,
@@ -6429,16 +6411,9 @@ fn parse_ewf2_ranges(
                     DefectKind::UnverifiedChunkTable,
                     segment_index,
                     section.desc.offset,
-                    "no intact copy exists, so each of its chunks is returned only when the \
-                     chunk's own checksum verifies it and its entry does not overlap another",
+                    "no intact copy exists; payload checksums cannot establish logical chunk \
+                     positions, so reads through this table fail",
                 )?;
-                rejected_chunks.extend(inconsistent_ewf2_entries(
-                    file,
-                    entries_offset,
-                    entries_bytes,
-                    header.first_chunk,
-                    &sector_data,
-                )?);
                 false
             }
         };
@@ -6456,6 +6431,7 @@ fn parse_ewf2_ranges(
             ewf1_compression_method: None,
             ewf2_compression_method: Some(compression_method_code(compression_method)),
             entries_verified,
+            mapping_unverified,
             data_start: None,
         });
     }
@@ -6463,67 +6439,7 @@ fn parse_ewf2_ranges(
     if ranges.is_empty() && logical_size > 0 && !leniency.is_lenient() {
         return Err(EwfError::Malformed("EWF2 image has no sector table".into()));
     }
-    Ok(Ewf2Ranges {
-        ranges,
-        rejected_chunks,
-    })
-}
-
-/// Chunks of an unverified EWF2 table whose data entries cannot be trusted
-/// even if the data verifies itself: entries outside the segment's sector data,
-/// entries that start where another entry starts (a damaged offset that points
-/// at another chunk), and entries whose data runs into the next entry's.
-/// Pattern-fill entries carry no data to verify and fail when read.
-fn inconsistent_ewf2_entries(
-    file: &mut dyn SegmentReader,
-    entries_offset: u64,
-    entries_bytes: u64,
-    first_chunk: u64,
-    sector_data: &[(u64, u64)],
-) -> Result<Vec<u64>> {
-    let entries = read_exact_at(file, entries_offset, entries_bytes)?;
-    let mut extents = Vec::new();
-    let mut rejected = Vec::new();
-    for (index, entry) in (0_u64..).zip(entries.as_chunks::<{ ewf2::TABLE_ENTRY_SIZE }>().0) {
-        let entry = ewf2::TableEntry::parse(entry, ewf2::CompressionMethod::Zlib)?;
-        if entry.kind == ewf2::ChunkKind::PatternFill {
-            continue;
-        }
-        let start = entry.chunk_data_offset;
-        let end = start.checked_add(u64::from(entry.chunk_data_size));
-        let inside = end.is_some_and(|end| {
-            entry.chunk_data_size > 0
-                && sector_data
-                    .iter()
-                    .any(|(data_start, data_end)| start >= *data_start && end <= *data_end)
-        });
-        if inside {
-            extents.push((start, end.unwrap_or(start), index));
-        } else {
-            rejected.push(first_chunk.saturating_add(index));
-        }
-    }
-    extents.sort_unstable();
-    for pair in extents.windows(2) {
-        if let [
-            (previous_start, previous_end, previous),
-            (start, _, current),
-        ] = pair
-        {
-            if start == previous_start {
-                // A damaged offset that names another chunk's start would read
-                // that chunk, which verifies itself: neither entry can be trusted.
-                rejected.push(first_chunk.saturating_add(*previous));
-                rejected.push(first_chunk.saturating_add(*current));
-            } else if start < previous_end {
-                // A data size that runs into the next chunk is damaged.
-                rejected.push(first_chunk.saturating_add(*previous));
-            }
-        }
-    }
-    rejected.sort_unstable();
-    rejected.dedup();
-    Ok(rejected)
+    Ok(ranges)
 }
 
 fn read_exact_at(file: &mut dyn SegmentReader, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -7181,13 +7097,16 @@ fn validate_adler32_checksum_value(stored: u32, checksum_data: &[u8], label: &st
 }
 
 fn validate_raw_chunk_checksum(encoded: &[u8], logical_size: usize) -> Result<()> {
-    let checksum_offset = logical_size;
-    if encoded.len() < checksum_offset + 4 {
+    let checksum_offset = encoded
+        .len()
+        .checked_sub(4)
+        .ok_or_else(|| EwfError::Malformed("raw chunk checksum trailer is missing".into()))?;
+    if checksum_offset < logical_size {
         return Err(EwfError::Malformed(
             "raw chunk checksum trailer is missing".into(),
         ));
     }
-    validate_adler32_checksum(encoded, checksum_offset, logical_size, "raw chunk")
+    validate_adler32_checksum(encoded, checksum_offset, checksum_offset, "raw chunk")
 }
 
 fn adler32(data: &[u8]) -> u32 {

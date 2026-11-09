@@ -262,13 +262,20 @@ fn damaged_ewf2_hashes_are_ignored_and_reported() {
     assert_eq!(readable_chunks(&image, &written.data), 2);
 }
 
-/// One compressed chunk holding a full 32 KiB although the volume declares
+/// One raw or compressed chunk holding a full 32 KiB although the volume declares
 /// fewer sectors, as some libewf versions wrote the final chunk.
-fn overlong_final_chunk_image(sectors: u64) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+fn overlong_final_chunk_image(sectors: u64, raw: bool) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
     let data = media(1);
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&data).unwrap();
-    let chunk = encoder.finish().unwrap();
+    let chunk = if raw {
+        let mut chunk = data.clone();
+        chunk.extend(adler32(&data).to_le_bytes());
+        chunk
+    } else {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&data).unwrap();
+        encoder.finish().unwrap()
+    };
 
     let volume_offset = 13_u64;
     let sectors_offset = volume_offset + 76 + 94;
@@ -299,8 +306,9 @@ fn overlong_final_chunk_image(sectors: u64) -> (tempfile::TempDir, PathBuf, Vec<
     let checksum = adler32(&header[..20]);
     header[20..24].copy_from_slice(&checksum.to_le_bytes());
     bytes.extend(header);
+    let compression_flag = if raw { 0 } else { 0x8000_0000_u32 };
     let entry =
-        (0x8000_0000_u32 | u32::try_from(chunk_offset - sectors_offset).unwrap()).to_le_bytes();
+        (compression_flag | u32::try_from(chunk_offset - sectors_offset).unwrap()).to_le_bytes();
     bytes.extend(entry);
     bytes.extend(adler32(&entry).to_le_bytes());
     bytes.extend(descriptor(b"done", done_offset, 76));
@@ -333,7 +341,7 @@ fn adler32(data: &[u8]) -> u32 {
 
 #[test]
 fn overlong_final_chunk_keeps_the_media_bytes() {
-    let (_dir, path, expected) = overlong_final_chunk_image(56);
+    let (_dir, path, expected) = overlong_final_chunk_image(56, false);
     let mut buffer = vec![0; expected.len()];
 
     let strict = open_strict(&path).unwrap();
@@ -891,7 +899,7 @@ fn damaged_table_header_without_a_copy_locates_the_chunks_by_decoding() {
 }
 
 #[test]
-fn unverified_table_returns_only_chunks_that_verify_themselves() {
+fn unverified_table_rejects_even_payloads_with_valid_checksums() {
     let data = media(6);
     let (_dir, path) = Ewf1Build {
         table2: false,
@@ -909,17 +917,18 @@ fn unverified_table_returns_only_chunks_that_verify_themselves() {
     assert!(open_strict(&path).is_err());
     let image = Image::open(&path).unwrap();
     assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
-    // Chunks 2 and 5 still verify themselves.
-    assert_eq!(readable_chunks(&image, &data), 2);
+    // Chunks 2 and 5 still verify themselves, but that does not authenticate
+    // their logical positions in a damaged table.
+    assert_eq!(readable_chunks(&image, &data), 0);
     let mut chunk = vec![0; CHUNK];
-    assert!(image.read_at(&mut chunk, 2 * CHUNK as u64).is_ok());
-    assert!(image.read_at(&mut chunk, 5 * CHUNK as u64).is_ok());
+    assert!(image.read_at(&mut chunk, 2 * CHUNK as u64).is_err());
+    assert!(image.read_at(&mut chunk, 5 * CHUNK as u64).is_err());
     assert!(image.read_encoded_data_chunk(1).is_err());
-    assert!(image.read_encoded_data_chunk(2).is_ok());
+    assert!(image.read_encoded_data_chunk(2).is_err());
 }
 
 #[test]
-fn unverified_table_returns_raw_chunks_only_with_their_checksum() {
+fn unverified_table_rejects_raw_chunks_despite_their_checksums() {
     let data = media(4);
     let (_dir, path) = Ewf1Build {
         compressed: false,
@@ -933,7 +942,7 @@ fn unverified_table_returns_raw_chunks_only_with_their_checksum() {
 
     let image = Image::open(&path).unwrap();
     assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
-    assert_eq!(readable_chunks(&image, &data), 2);
+    assert_eq!(readable_chunks(&image, &data), 0);
 }
 
 /// Byte offset of EWF2 table entry `index` in an image written by this crate.
@@ -942,7 +951,7 @@ fn ewf2_entry(path: &Path, index: u64) -> u64 {
 }
 
 #[test]
-fn unverified_ewf2_table_returns_only_chunks_that_verify_themselves() {
+fn unverified_ewf2_table_rejects_even_payloads_with_valid_checksums() {
     let written = ex01(4);
     // Chunk 1's stored size.
     flip(&written.path, ewf2_entry(&written.path, 1) + 8);
@@ -950,7 +959,7 @@ fn unverified_ewf2_table_returns_only_chunks_that_verify_themselves() {
     assert!(open_strict(&written.path).is_err());
     let image = Image::open(&written.path).unwrap();
     assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
-    assert_eq!(readable_chunks(&image, &written.data), 3);
+    assert_eq!(readable_chunks(&image, &written.data), 0);
 }
 
 #[test]
@@ -973,7 +982,7 @@ fn unverified_ewf2_entries_pointing_at_another_chunk_fail() {
 
         let image = Image::open(&written.path).unwrap();
         assert_eq!(kinds(&image), [IntegrityFindingKind::UnverifiedChunkTable]);
-        assert_eq!(readable_chunks(&image, &written.data), 2);
+        assert_eq!(readable_chunks(&image, &written.data), 0);
     }
 }
 
@@ -1026,7 +1035,7 @@ fn corruption_probes_report_damage_that_lenient_opening_goes_past() {
 }
 
 #[test]
-fn truncated_ewf2_segment_keeps_the_complete_entries_of_its_last_table() {
+fn truncated_ewf2_table_cannot_authenticate_its_remaining_entries() {
     let written = ex01(8);
     let table = ewf2_section(&sections(&written.path), 0x04);
     // Five complete entries and three bytes of the sixth remain.
@@ -1044,7 +1053,7 @@ fn truncated_ewf2_segment_keeps_the_complete_entries_of_its_last_table() {
             IntegrityFindingKind::ChunksUnavailable
         ]
     );
-    assert_eq!(readable_chunks(&image, &written.data), 5);
+    assert_eq!(readable_chunks(&image, &written.data), 0);
 }
 
 #[test]
@@ -1279,7 +1288,7 @@ fn media_size_taken_from_damaged_tables_is_reported() {
         .find(|finding| finding.message.contains("media may be larger"))
         .unwrap();
     assert_eq!(size.kind, IntegrityFindingKind::ChunksUnavailable);
-    assert_eq!(readable_chunks(&image, &data[..CHUNK]), 1);
+    assert_eq!(readable_chunks(&image, &data[..CHUNK]), 0);
 }
 
 #[test]
@@ -1291,7 +1300,7 @@ fn media_size_recorded_in_the_metadata_survives_a_lost_table() {
 
     let image = Image::open(&path).unwrap();
     assert_eq!(image.media_size(), data.len() as u64);
-    assert_eq!(readable_chunks(&image, &data), 1);
+    assert_eq!(readable_chunks(&image, &data), 0);
 }
 
 #[test]
@@ -1586,4 +1595,96 @@ fn damaged_section_name_close_to_one_known_name_is_restored() {
     );
     assert_eq!(image.sections()[0].kind, SectionKind::Ewf1("volume".into()));
     assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn damaged_ewf2_table_cannot_silently_swap_verified_chunk_payloads() {
+    for data in [media(4), noise(4)] {
+        let written = ex01_of(&data);
+        let first = usize::try_from(ewf2_entry(&written.path, 1)).unwrap();
+        let second = usize::try_from(ewf2_entry(&written.path, 2)).unwrap();
+        modify(&written.path, |bytes| {
+            let a = bytes[first..first + 16].to_vec();
+            let b = bytes[second..second + 16].to_vec();
+            bytes[first..first + 16].copy_from_slice(&b);
+            bytes[second..second + 16].copy_from_slice(&a);
+        });
+        assert!(open_strict(&written.path).is_err());
+        let image = Image::open(&written.path).unwrap();
+        assert_eq!(readable_chunks(&image, &written.data), 0);
+        assert!(image.read_encoded_data_chunk(1).is_err());
+    }
+}
+
+#[test]
+fn damaged_ewf1_table_cannot_silently_shift_verified_chunk_payloads() {
+    for (compressed, table2) in [(false, false), (true, false), (false, true), (true, true)] {
+        let data = media(4);
+        let (_dir, path) = Ewf1Build {
+            compressed,
+            table2,
+            data_copy: true,
+        }
+        .write(&data);
+        // Offsets remain ordered for the first three entries. Chunk 1 now
+        // selects chunk 2, whose payload and checksum are both intact.
+        let second = ewf1_entry(&path, "table", 1);
+        let third = ewf1_entry(&path, "table", 2);
+        let fourth = ewf1_entry(&path, "table", 3);
+        let third_value = get_u32(&path, third);
+        let fourth_value = get_u32(&path, fourth);
+        set_u32(&path, second, third_value);
+        set_u32(&path, third, fourth_value);
+
+        assert!(open_strict(&path).is_err());
+        let image = Image::open(&path).unwrap();
+        assert_eq!(readable_chunks(&image, &data), if table2 { 4 } else { 0 });
+        assert_eq!(image.read_encoded_data_chunk(1).is_ok(), table2);
+    }
+}
+
+#[test]
+fn damaged_ewf2_sector_hash_preserves_chunks_with_verified_mappings() {
+    for data in [media(4), noise(4)] {
+        let written = ex01_of(&data);
+        let sector_data = ewf2_section(&sections(&written.path), 0x03);
+        modify(&written.path, |bytes| {
+            let start = usize::try_from(sector_data.descriptor_offset).unwrap();
+            let descriptor = &mut bytes[start..start + 64];
+            descriptor[4] |= 1; // Enable the sector data's MD5 integrity hash.
+            descriptor[32..48].fill(0); // A bad hash, but intact chunk data.
+            let checksum = adler32(&descriptor[..60]);
+            descriptor[60..64].copy_from_slice(&checksum.to_le_bytes());
+        });
+
+        assert!(open_strict(&written.path).is_err());
+        let image = Image::open(&written.path).unwrap();
+        assert_eq!(
+            kinds(&image),
+            [IntegrityFindingKind::StructureChecksumMismatch]
+        );
+        assert_eq!(readable_chunks(&image, &written.data), 4);
+        assert!(image.read_encoded_data_chunk(1).is_ok());
+    }
+}
+
+#[test]
+fn overlong_raw_final_chunk_checks_its_entire_payload() {
+    for damage_offset in [Some(0), Some(CHUNK - 1), Some(CHUNK), None] {
+        let (_dir, path, expected) = overlong_final_chunk_image(56, true);
+        let chunk_offset = ewf1_section(&sections(&path), 0, "sectors").data_offset;
+        if let Some(offset) = damage_offset {
+            flip(&path, chunk_offset + offset as u64);
+        }
+        let image = Image::open(&path).unwrap();
+        let mut buffer = vec![0; expected.len()];
+        let result = image.read_at(&mut buffer, 0);
+        if damage_offset.is_some() {
+            assert!(result.is_err(), "a bad raw payload/checksum was accepted");
+        } else {
+            assert_eq!(result.unwrap(), expected.len());
+            assert_eq!(buffer, expected);
+            assert_eq!(kinds(&image), [IntegrityFindingKind::OverlongChunk]);
+        }
+    }
 }

@@ -35,7 +35,10 @@ jobs:
           cargo clippy --all-targets --locked
           cargo clippy --all-targets --all-features --locked
       - name: Test
-        run: cargo test --all-features --locked
+        run: |
+          cargo test --locked
+          cargo test --no-default-features --locked
+          cargo test --all-features --locked
       - name: Docs
         run: cargo doc --no-deps --all-features --locked
         env:

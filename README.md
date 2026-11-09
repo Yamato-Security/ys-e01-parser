@@ -76,7 +76,9 @@ instead, which is what this fork changes.
   uses its intact copy (`table2`, the other geometry section, a later segment's); a damaged
   section descriptor is followed when its offsets agree with the file; damaged hash, digest and
   header sections are left out. A chunk that can't be verified (zlib's Adler-32, a raw chunk's
-  checksum) fails when read, and nothing else is substituted. `OpenStrictness::Strict` keeps
+  checksum) fails when read, and nothing else is substituted. When a table's entries fail their
+  checksum and no intact copy exists, reads through that table also fail: a payload checksum
+  verifies bytes, not their logical position in the image. `OpenStrictness::Strict` keeps
   ewf-image's behaviour.
 - **An overlong last chunk**, which some writers store with more bytes than the media needs, gives
   the media's bytes with an `OverlongChunk` warning instead of failing.

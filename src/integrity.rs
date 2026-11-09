@@ -79,11 +79,11 @@ pub enum IntegrityFindingKind {
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.
     MetadataUnavailable,
-    /// Chunk table entries failed their checksum and no intact copy exists, or
-    /// the table was lost and the chunks were located by decoding them in
-    /// order. Each such chunk is returned only when its own checksum (zlib
-    /// Adler-32 or the raw chunk checksum) verifies it and its location is
-    /// consistent with the other chunks; other chunks fail when read.
+    /// Chunk table entries failed their checksum and no intact copy exists:
+    /// reads through that table fail, because a payload checksum cannot verify
+    /// its logical position. Also used when a lost EWF1 table was recovered by
+    /// decoding chunks sequentially from a known position; only those chunks
+    /// whose complete payload checksums verify are readable.
     UnverifiedChunkTable,
     /// Chunks with no usable chunk table, because the table is missing from a
     /// damaged segment or the segment's position in the media is unknown.
