@@ -31,6 +31,18 @@ pub(crate) fn decode_chunk_with_padding(
     logical_size: usize,
     maximum_decoded_size: usize,
 ) -> Result<Vec<u8>> {
+    decode_chunk_with_decoded_length(encoded, encoding, logical_size, maximum_decoded_size)
+        .map(|(decoded, _)| decoded)
+}
+
+/// Decodes like [`decode_chunk_with_padding`] and also returns how many bytes the
+/// encoded data produced before the result was cut to `logical_size`.
+pub(crate) fn decode_chunk_with_decoded_length(
+    encoded: &[u8],
+    encoding: ChunkEncoding,
+    logical_size: usize,
+    maximum_decoded_size: usize,
+) -> Result<(Vec<u8>, usize)> {
     if maximum_decoded_size < logical_size {
         return Err(EwfError::Malformed(
             "decoded chunk size bound is too small".into(),
@@ -44,7 +56,7 @@ pub(crate) fn decode_chunk_with_padding(
                     encoded.len()
                 )));
             }
-            Ok(encoded[..logical_size].to_vec())
+            Ok((encoded[..logical_size].to_vec(), logical_size))
         }
         ChunkEncoding::Zlib => decode_compressed(
             ZlibDecoder::new(encoded),
@@ -55,7 +67,9 @@ pub(crate) fn decode_chunk_with_padding(
         ChunkEncoding::Bzip2 => {
             decode_compressed(BzDecoder::new(encoded), logical_size, maximum_decoded_size)
         }
-        ChunkEncoding::PatternFill(pattern) => Ok(pattern_fill(pattern, logical_size)),
+        ChunkEncoding::PatternFill(pattern) => {
+            Ok((pattern_fill(pattern, logical_size), logical_size))
+        }
     }
 }
 
@@ -90,9 +104,9 @@ fn decode_xways_zstd(
     encoded: &[u8],
     logical_size: usize,
     maximum_decoded_size: usize,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, usize)> {
     if encoded == [0] {
-        return Ok(vec![0; logical_size]);
+        return Ok((vec![0; logical_size], logical_size));
     }
     if encoded.len() == 1 {
         return Err(EwfError::Malformed(format!(
@@ -119,7 +133,7 @@ fn decode_compressed(
     mut reader: impl Read,
     logical_size: usize,
     maximum_decoded_size: usize,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, usize)> {
     let limit = maximum_decoded_size
         .checked_add(1)
         .ok_or_else(|| EwfError::Malformed("logical chunk size overflow".into()))?;
@@ -141,8 +155,9 @@ fn decode_compressed(
             decoded.len()
         )));
     }
+    let decoded_length = decoded.len();
     decoded.truncate(logical_size);
-    Ok(decoded)
+    Ok((decoded, decoded_length))
 }
 
 fn pattern_fill(pattern: u64, logical_size: usize) -> Vec<u8> {

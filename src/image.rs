@@ -15,7 +15,7 @@ use md5::Digest as _;
 
 use crate::codepage::decode_header_bytes;
 use crate::decode::{
-    ChunkEncoding, decode_chunk_with_padding, raw_chunk_size_cap, validate_encoded_size,
+    ChunkEncoding, decode_chunk_with_decoded_length, raw_chunk_size_cap, validate_encoded_size,
     zlib_compressed_chunk_size_cap,
 };
 use crate::encryption::EncryptionContext;
@@ -101,6 +101,8 @@ struct ImageInner {
     // Read only through the `verify` feature's integrity findings.
     #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     defects: Vec<Defect>,
+    #[cfg_attr(not(feature = "verify"), allow(dead_code))]
+    read_defects: Mutex<Vec<Defect>>,
     read_zero_chunk_on_error: AtomicBool,
     abort_signaled: AtomicBool,
 }
@@ -859,6 +861,7 @@ impl Image {
                 statistics,
                 checksum_errors: Mutex::new(Vec::new()),
                 defects: leniency.into_defects(),
+                read_defects: Mutex::new(Vec::new()),
                 read_zero_chunk_on_error: AtomicBool::new(options.read_zero_chunk_on_error()),
                 abort_signaled: AtomicBool::new(false),
             }),
@@ -873,10 +876,14 @@ impl Image {
         Ok(image)
     }
 
-    /// Defects recorded while opening.
+    /// Defects recorded while opening, followed by those found while reading.
     #[cfg(feature = "verify")]
     pub(crate) fn defects(&self) -> Vec<Defect> {
-        self.inner.defects.clone()
+        let mut defects = self.inner.defects.clone();
+        if let Ok(read) = self.inner.read_defects.lock() {
+            defects.extend(read.iter().cloned());
+        }
+        defects
     }
 
     /// Returns parsed image metadata and geometry.
@@ -2201,24 +2208,45 @@ impl Image {
                 ChunkEncoding::Zlib | ChunkEncoding::Zstd | ChunkEncoding::Bzip2
             ))
         .then(Instant::now);
-        let maximum_decoded_size = if self.inner.info.format == Format::Ewf1
+        let full_chunk_size = usize::try_from(self.inner.info.chunk_size)
+            .map_err(|_| EwfError::Malformed("chunk size does not fit usize".into()))?;
+        let padded_logical_profile = self.inner.info.format == Format::Ewf1
             && matches!(
                 self.inner.info.format_profile,
                 FormatProfile::LogicalEnCase5
                     | FormatProfile::LogicalEnCase6
                     | FormatProfile::LogicalEnCase7
-            ) {
-            usize::try_from(self.inner.info.chunk_size)
-                .map_err(|_| EwfError::Malformed("chunk size does not fit usize".into()))?
+            );
+        // Only the final chunk is shorter than a full chunk. Some writers store
+        // a few bytes past the media end in it; lenient reading keeps the media's
+        // bytes, as libewf does, and records the condition.
+        let lenient_final_chunk = self.inner.open_strictness == OpenStrictness::Lenient
+            && chunk.logical_size < full_chunk_size;
+        let maximum_decoded_size = if padded_logical_profile || lenient_final_chunk {
+            full_chunk_size.max(chunk.logical_size)
         } else {
             chunk.logical_size
         };
-        let decoded = decode_chunk_with_padding(
+        let (decoded, decoded_length) = decode_chunk_with_decoded_length(
             &encoded,
             chunk.encoding,
             chunk.logical_size,
             maximum_decoded_size,
         )?;
+        if !padded_logical_profile && decoded_length > chunk.logical_size {
+            self.record_read_defect(Defect {
+                kind: DefectKind::OverlongChunk,
+                message: format!(
+                    "final chunk {chunk_id} decoded to {decoded_length} bytes but the media \
+                     ends after {}; the extra {} bytes were dropped",
+                    chunk.logical_size,
+                    decoded_length - chunk.logical_size
+                ),
+                segment_index: Some(chunk.segment_index),
+                segment_offset: Some(chunk.offset),
+                chunk_index: Some(chunk_id),
+            });
+        }
         if let Some(started) = decompression_started {
             self.inner
                 .statistics
@@ -2258,6 +2286,15 @@ impl Image {
                 Ok((vec![0; chunk.logical_size], true))
             }
             Err(err) => Err(err),
+        }
+    }
+
+    fn record_read_defect(&self, defect: Defect) {
+        // A poisoned lock only loses the record; the read itself is unaffected.
+        if let Ok(mut defects) = self.inner.read_defects.lock()
+            && !defects.contains(&defect)
+        {
+            defects.push(defect);
         }
     }
 

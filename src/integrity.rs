@@ -50,6 +50,9 @@ pub enum IntegrityFindingKind {
     /// A damaged metadata section (header, hash, digest, error, session, or
     /// similar) was ignored, so its values are unavailable.
     MetadataUnavailable,
+    /// A chunk decoded to more bytes than the media size leaves for it. The
+    /// media's bytes were kept and the extra bytes dropped.
+    OverlongChunk,
     /// One complete media digest differs from its reference.
     HashMismatch {
         /// Digest algorithm.
@@ -150,6 +153,10 @@ fn defect_finding(defect: &Defect, chunk_size: u64) -> IntegrityFinding {
         DefectKind::MetadataUnavailable => (
             IntegrityFindingKind::MetadataUnavailable,
             IntegritySeverity::Error,
+        ),
+        DefectKind::OverlongChunk => (
+            IntegrityFindingKind::OverlongChunk,
+            IntegritySeverity::Warning,
         ),
         DefectKind::Irregular => (
             IntegrityFindingKind::LenientOpen,
@@ -288,6 +295,8 @@ impl Image {
     /// affected chunks fail when read). Lenient opening never substitutes data:
     /// a chunk it cannot verify fails when read. The list is empty for an image
     /// opened with [`crate::OpenStrictness::Strict`] and for an undamaged image.
+    /// Conditions found while reading (such as an overlong final chunk) appear
+    /// once the affected chunk has been read; [`Image::analyze`] reads every chunk.
     pub fn lenient_findings(&self) -> Vec<IntegrityFinding> {
         self.defects()
             .iter()

@@ -2,6 +2,7 @@
 //! readable, every defect is reported, and no read returns wrong bytes.
 #![cfg(feature = "verify")]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ewf_image::{
@@ -230,4 +231,96 @@ fn damaged_ewf2_hashes_are_ignored_and_reported() {
         ]
     );
     assert_eq!(readable_chunks(&image, &written.data), 2);
+}
+
+/// One compressed chunk holding a full 32 KiB although the volume declares
+/// fewer sectors, as some libewf versions wrote the final chunk.
+fn overlong_final_chunk_image(sectors: u64) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    let data = media(1);
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&data).unwrap();
+    let chunk = encoder.finish().unwrap();
+
+    let volume_offset = 13_u64;
+    let sectors_offset = volume_offset + 76 + 94;
+    let chunk_offset = sectors_offset + 76;
+    let table_offset = chunk_offset + chunk.len() as u64;
+    let done_offset = table_offset + 76 + 24 + 4 + 4;
+
+    let mut bytes = b"EVF\x09\x0d\x0a\xff\x00\x01\x01\x00\x00\x00".to_vec();
+    bytes.extend(descriptor(b"volume", sectors_offset, 76 + 94));
+    let mut volume = [0_u8; 94];
+    volume[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    volume[8..12].copy_from_slice(&64_u32.to_le_bytes());
+    volume[12..16].copy_from_slice(&512_u32.to_le_bytes());
+    volume[16..20].copy_from_slice(&u32::try_from(sectors).unwrap().to_le_bytes());
+    let checksum = adler32(&volume[..90]);
+    volume[90..94].copy_from_slice(&checksum.to_le_bytes());
+    bytes.extend(volume);
+    bytes.extend(descriptor(
+        b"sectors",
+        table_offset,
+        76 + chunk.len() as u64,
+    ));
+    bytes.extend(&chunk);
+    bytes.extend(descriptor(b"table", done_offset, 76 + 24 + 8));
+    let mut header = [0_u8; 24];
+    header[0..4].copy_from_slice(&1_u32.to_le_bytes());
+    header[8..16].copy_from_slice(&sectors_offset.to_le_bytes());
+    let checksum = adler32(&header[..20]);
+    header[20..24].copy_from_slice(&checksum.to_le_bytes());
+    bytes.extend(header);
+    let entry =
+        (0x8000_0000_u32 | u32::try_from(chunk_offset - sectors_offset).unwrap()).to_le_bytes();
+    bytes.extend(entry);
+    bytes.extend(adler32(&entry).to_le_bytes());
+    bytes.extend(descriptor(b"done", done_offset, 76));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overlong.E01");
+    std::fs::write(&path, bytes).unwrap();
+    let size = usize::try_from(sectors * 512).unwrap();
+    (dir, path, data[..size].to_vec())
+}
+
+fn descriptor(kind: &[u8], next: u64, size: u64) -> [u8; 76] {
+    let mut bytes = [0; 76];
+    bytes[..kind.len()].copy_from_slice(kind);
+    bytes[16..24].copy_from_slice(&next.to_le_bytes());
+    bytes[24..32].copy_from_slice(&size.to_le_bytes());
+    let checksum = adler32(&bytes[..72]);
+    bytes[72..76].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for byte in data {
+        a = (a + u32::from(*byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+#[test]
+fn overlong_final_chunk_keeps_the_media_bytes() {
+    let (_dir, path, expected) = overlong_final_chunk_image(56);
+    let mut buffer = vec![0; expected.len()];
+
+    let strict = open_strict(&path).unwrap();
+    assert!(strict.read_at(&mut buffer, 0).is_err());
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(kinds(&image), Vec::<IntegrityFindingKind>::new());
+    assert_eq!(image.read_at(&mut buffer, 0).unwrap(), expected.len());
+    assert_eq!(buffer, expected);
+    let findings = image.lenient_findings();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, IntegrityFindingKind::OverlongChunk);
+    assert_eq!(findings[0].chunk_index, Some(0));
+    let md5: [u8; 16] = {
+        use md5::Digest as _;
+        md5::Md5::digest(&expected).into()
+    };
+    assert_eq!(image.verify().unwrap().computed_md5, Some(md5));
 }

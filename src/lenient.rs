@@ -1,6 +1,7 @@
 //! Bookkeeping for structural defects that lenient opening goes past.
 //!
-//! The reader records each tolerated defect here while opening. With the `verify` feature the records
+//! The reader records each tolerated defect here while opening (and, for a few
+//! chunk-level conditions, while reading). With the `verify` feature the records
 //! are exposed as [`crate::IntegrityFinding`] values; the internal form keeps the
 //! reader independent of that feature.
 
@@ -11,6 +12,8 @@ use crate::{EwfError, OpenStrictness, Result};
 pub(crate) enum DefectKind {
     /// A damaged metadata section was ignored.
     MetadataUnavailable,
+    /// A chunk decoded to more bytes than the media holds; the extra bytes were dropped.
+    OverlongChunk,
     /// Another irregularity that lenient opening accepted.
     Irregular,
 }
