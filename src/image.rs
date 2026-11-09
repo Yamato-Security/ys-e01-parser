@@ -3143,6 +3143,20 @@ struct Ewf2Section {
     data_offset: u64,
     data_size: u64,
     layout: Ewf2SectionLayout,
+    /// Lenient opening found the data damaged (its integrity hash failed) or
+    /// cut short by the end of the segment.
+    damaged_data: bool,
+    /// A sector table recovered after the last intact descriptor of a truncated
+    /// segment; it has no descriptor of its own.
+    salvaged: bool,
+}
+
+/// EWF2 sections in chain order.
+struct Ewf2Chain {
+    sections: Vec<Ewf2Section>,
+    /// False when the end of the chain was lost (a truncated or damaged final
+    /// descriptor), so the segment's last sections may be missing.
+    complete: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3785,17 +3799,21 @@ fn parse_ewf2_segment(
     leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<ParsedSegment> {
-    let strictness = if leniency.is_lenient() {
-        OpenStrictness::Lenient
-    } else {
-        OpenStrictness::Strict
-    };
     let mut header = [0; ewf2::FILE_HEADER_SIZE];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
     let header = ewf2::FileHeader::parse(&header)?;
-    let sections = scan_ewf2_sections(file, strictness)?;
-    let acquisition_complete = ewf2_acquisition_complete(&sections);
+    let chain = scan_ewf2_sections(file, segment_index, leniency)?;
+    let sections = chain.sections;
+    let acquisition_complete = if leniency.is_lenient() {
+        // A lenient chain is complete only when it ends in a terminal section.
+        chain.complete
+            && sections
+                .last()
+                .is_some_and(|section| section.desc.section_type == ewf2::SectionType::Done)
+    } else {
+        ewf2_acquisition_complete(&sections)
+    };
 
     let mut chunk_size = 0;
     let mut logical_size = 0;
@@ -3842,6 +3860,20 @@ fn parse_ewf2_segment(
                 Some(segment_index),
                 Some(section.desc.offset),
                 format!("skipped unknown EWF2 section type 0x{value:x}"),
+            );
+            continue;
+        }
+        if section.damaged_data
+            && !matches!(
+                section.desc.section_type,
+                ewf2::SectionType::SectorData | ewf2::SectionType::SectorTable
+            )
+        {
+            leniency.record(
+                DefectKind::MetadataUnavailable,
+                Some(segment_index),
+                Some(section.desc.offset),
+                "the section's data failed its integrity hash, so its values are not used",
             );
             continue;
         }
@@ -4078,6 +4110,7 @@ fn parse_ewf2_segment(
         format: Format::Ewf2,
         sections: sections
             .iter()
+            .filter(|section| !section.salvaged)
             .map(|section| {
                 let raw_kind = read_exact_at(file, section.desc.offset, 4)?;
                 Ok(SectionInfo {
@@ -4344,17 +4377,482 @@ fn ewf1_acquisition_complete(chain: &Ewf1Chain) -> bool {
 
 fn scan_ewf2_sections(
     file: &mut dyn SegmentReader,
-    strictness: OpenStrictness,
-) -> Result<Vec<Ewf2Section>> {
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Ewf2Chain> {
     let file_len = file.segment_len()?;
     if file_len < ewf2::FILE_HEADER_SIZE as u64 + ewf2::SECTION_DESCRIPTOR_SIZE as u64 {
         return Err(EwfError::Malformed("EWF2 file is too short".into()));
     }
 
-    if let Some(sections) = scan_ewf2_leading_sections(file, file_len, strictness)? {
-        return Ok(sections);
+    if !leniency.is_lenient() {
+        if let Some(sections) = scan_ewf2_leading_sections(file, file_len, OpenStrictness::Strict)?
+        {
+            return Ok(Ewf2Chain {
+                sections,
+                complete: true,
+            });
+        }
+        return Ok(Ewf2Chain {
+            sections: scan_ewf2_trailing_sections(file, file_len, OpenStrictness::Strict)?,
+            complete: true,
+        });
     }
-    scan_ewf2_trailing_sections(file, file_len, strictness)
+    if let Some(chain) =
+        scan_ewf2_leading_sections_lenient(file, file_len, segment_index, leniency)?
+    {
+        return Ok(chain);
+    }
+    scan_ewf2_trailing_sections_lenient(file, file_len, segment_index, leniency)
+}
+
+/// Lenient form of [`scan_ewf2_leading_sections`]: damage after the first
+/// section ends the chain there instead of failing, and a descriptor whose
+/// checksum failed is followed when its sizes place the next one consistently.
+fn scan_ewf2_leading_sections_lenient(
+    file: &mut dyn SegmentReader,
+    file_len: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Option<Ewf2Chain>> {
+    let descriptor_size = ewf2::SECTION_DESCRIPTOR_SIZE as u64;
+    let mut sections = Vec::new();
+    let mut offset = ewf2::FILE_HEADER_SIZE as u64;
+    loop {
+        let stop = |sections: Vec<Ewf2Section>,
+                    leniency: &mut Leniency,
+                    kind: DefectKind,
+                    message: &str|
+         -> Result<Option<Ewf2Chain>> {
+            if sections.is_empty() {
+                return Ok(None);
+            }
+            leniency.tolerate(
+                EwfError::Malformed(message.into()),
+                kind,
+                segment_index,
+                offset,
+                "the rest of the segment is ignored",
+            )?;
+            Ok(Some(Ewf2Chain {
+                sections,
+                complete: false,
+            }))
+        };
+        if offset
+            .checked_add(descriptor_size)
+            .is_none_or(|end| end > file_len)
+        {
+            return stop(
+                sections,
+                leniency,
+                DefectKind::TruncatedSegment,
+                "EWF2 leading section descriptor exceeds file",
+            );
+        }
+        let buf = read_exact_at(file, offset, descriptor_size)?;
+        let desc = ewf2::SectionDescriptor::parse(&buf, offset)?;
+        if desc.descriptor_size != ewf2::SECTION_DESCRIPTOR_SIZE as u32 {
+            return stop(
+                sections,
+                leniency,
+                DefectKind::BrokenSectionChain,
+                "EWF2 leading section descriptor is invalid",
+            );
+        }
+        let intact = validate_present_adler32_checksum(&buf, 60, 60, "EWF2 section descriptor");
+        let data_offset = offset.saturating_add(descriptor_size);
+        let data_end = data_offset.checked_add(desc.data_size);
+        let next_offset = data_end.and_then(|end| end.checked_add(u64::from(desc.padding_size)));
+        let Some(next_offset) = next_offset
+            .filter(|next| u64::from(desc.padding_size) <= desc.data_size && *next > offset)
+        else {
+            return stop(
+                sections,
+                leniency,
+                DefectKind::BrokenSectionChain,
+                "EWF2 leading section descriptor is invalid",
+            );
+        };
+        if let Err(error) = intact {
+            // The first section decides the layout; a damaged one is not taken
+            // as evidence of a leading layout.
+            if sections.is_empty() || matches!(desc.section_type, ewf2::SectionType::Unknown(_)) {
+                return stop(
+                    sections,
+                    leniency,
+                    DefectKind::BrokenSectionChain,
+                    &crate::lenient::describe(&error),
+                );
+            }
+            leniency.tolerate(
+                error,
+                DefectKind::ChecksumMismatch,
+                segment_index,
+                offset,
+                "its sizes are consistent, so the chain was followed",
+            )?;
+        }
+        if next_offset > file_len {
+            return stop(
+                sections,
+                leniency,
+                DefectKind::TruncatedSegment,
+                "EWF2 section data exceeds file",
+            );
+        }
+        reject_encrypted_ewf2_section(desc)?;
+        let damaged_data =
+            ewf2_section_data_is_damaged(file, desc, data_offset, segment_index, leniency)?;
+        sections.push(Ewf2Section {
+            desc,
+            data_offset,
+            data_size: desc.data_size,
+            layout: Ewf2SectionLayout::LeadingDescriptor,
+            damaged_data,
+            salvaged: false,
+        });
+        if is_terminal_ewf2_section(desc.section_type) {
+            return Ok(Some(Ewf2Chain {
+                sections,
+                complete: true,
+            }));
+        }
+        offset = next_offset;
+    }
+}
+
+/// Lenient form of [`scan_ewf2_trailing_sections`]. The chain is walked back
+/// from the end of the segment. A descriptor whose checksum failed is followed
+/// when its data exactly fills the space back to the previous descriptor. When
+/// the final descriptor is missing (a truncated segment) or a descriptor cannot
+/// be followed, the chain is found again at the nearest earlier intact
+/// descriptor whose own chain reaches the start of the segment. Sections in the
+/// lost range are ignored; a sector table cut short at the end is kept.
+fn scan_ewf2_trailing_sections_lenient(
+    file: &mut dyn SegmentReader,
+    file_len: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Ewf2Chain> {
+    let end_descriptor = file_len - ewf2::SECTION_DESCRIPTOR_SIZE as u64;
+    let (later, below) = match walk_ewf2_chain_back(file, end_descriptor, segment_index, leniency)?
+    {
+        Ewf2Walk::Complete(sections) => {
+            return finish_ewf2_trailing_chain(file, sections, segment_index, leniency, true);
+        }
+        Ewf2Walk::Broken { sections, at } => (sections, at),
+    };
+    let complete = !later.is_empty();
+    if complete {
+        leniency.record(
+            DefectKind::BrokenSectionChain,
+            Some(segment_index),
+            Some(below),
+            "EWF2 section descriptor is damaged and its offsets are inconsistent; the section \
+             it describes is ignored",
+        );
+    } else {
+        leniency.record(
+            DefectKind::TruncatedSegment,
+            Some(segment_index),
+            Some(below),
+            "EWF2 trailing section descriptor is invalid: the segment does not end with an \
+             intact section descriptor, so it is truncated or its end is damaged; sections \
+             after the last intact descriptor are missing",
+        );
+    }
+    let mut sections = Vec::new();
+    if let Some((found, earlier)) =
+        find_intact_ewf2_chain_below(file, below, segment_index, leniency)?
+    {
+        sections = earlier;
+        // A truncated segment that ends in the sector table after its sector
+        // data keeps the table's complete entries.
+        if later.is_empty()
+            && sections
+                .last()
+                .is_some_and(|section| section.desc.section_type == ewf2::SectionType::SectorData)
+            && let Some(table) = salvage_truncated_ewf2_table(file, found, file_len)?
+        {
+            sections.push(table);
+        }
+    }
+    sections.extend(later);
+    finish_ewf2_trailing_chain(file, sections, segment_index, leniency, complete)
+}
+
+fn finish_ewf2_trailing_chain(
+    file: &mut dyn SegmentReader,
+    sections: Vec<Ewf2Section>,
+    segment_index: usize,
+    leniency: &mut Leniency,
+    mut complete: bool,
+) -> Result<Ewf2Chain> {
+    if complete
+        && let Some(last) = sections.last()
+        && !is_terminal_ewf2_section(last.desc.section_type)
+    {
+        // Cut exactly after a descriptor: the chain is intact but ends early.
+        leniency.record(
+            DefectKind::TruncatedSegment,
+            Some(segment_index),
+            Some(last.desc.offset),
+            format!(
+                "the segment ends after a {:?} section instead of a done or next section; \
+                 the sections after it are missing",
+                last.desc.section_type
+            ),
+        );
+        complete = false;
+    }
+    let mut checked = Vec::with_capacity(sections.len());
+    for mut section in sections {
+        reject_encrypted_ewf2_section(section.desc)?;
+        if !section.damaged_data {
+            section.damaged_data = ewf2_section_data_is_damaged(
+                file,
+                section.desc,
+                section.data_offset,
+                segment_index,
+                leniency,
+            )?;
+        }
+        checked.push(section);
+    }
+    Ok(Ewf2Chain {
+        sections: checked,
+        complete,
+    })
+}
+
+enum Ewf2Walk {
+    /// Sections in chain order, back to the start of the segment.
+    Complete(Vec<Ewf2Section>),
+    /// The walk stopped at the descriptor at `at`; `sections` are the ones
+    /// after it, in chain order.
+    Broken { sections: Vec<Ewf2Section>, at: u64 },
+}
+
+/// Walks an EWF2 trailing-descriptor chain back from the descriptor at `start`.
+fn walk_ewf2_chain_back(
+    file: &mut dyn SegmentReader,
+    start: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Ewf2Walk> {
+    let mut sections = Vec::new();
+    let mut offset = start;
+    let max_sections = start / ewf2::SECTION_DESCRIPTOR_SIZE as u64 + 1;
+    for _ in 0..max_sections {
+        let Some((desc, intact)) = read_ewf2_trailing_descriptor(file, offset)? else {
+            sections.reverse();
+            return Ok(Ewf2Walk::Broken {
+                sections,
+                at: offset,
+            });
+        };
+        if !intact {
+            leniency.record(
+                DefectKind::ChecksumMismatch,
+                Some(segment_index),
+                Some(offset),
+                "EWF2 section descriptor checksum mismatch; its data exactly fills the space \
+                 back to the previous descriptor, so the chain was followed",
+            );
+        }
+        sections.push(Ewf2Section {
+            desc,
+            data_offset: ewf2_trailing_data_offset(&desc),
+            data_size: desc.data_size,
+            layout: Ewf2SectionLayout::TrailingDescriptor,
+            damaged_data: false,
+            salvaged: false,
+        });
+        if desc.previous_offset == 0 {
+            sections.reverse();
+            return Ok(Ewf2Walk::Complete(sections));
+        }
+        offset = desc.previous_offset;
+    }
+    sections.reverse();
+    Ok(Ewf2Walk::Broken {
+        sections,
+        at: offset,
+    })
+}
+
+fn ewf2_trailing_data_offset(desc: &ewf2::SectionDescriptor) -> u64 {
+    if desc.previous_offset == 0 {
+        ewf2::FILE_HEADER_SIZE as u64
+    } else {
+        desc.previous_offset
+            .saturating_add(ewf2::SECTION_DESCRIPTOR_SIZE as u64)
+    }
+}
+
+/// Reads the trailing descriptor at `offset` and returns it with whether its
+/// checksum matched, or `None` when it cannot be followed. An intact descriptor
+/// must satisfy the checks of strict opening (unknown types aside); a damaged
+/// one must also have data that exactly fills the space back to the previous
+/// descriptor.
+fn read_ewf2_trailing_descriptor(
+    file: &mut dyn SegmentReader,
+    offset: u64,
+) -> Result<Option<(ewf2::SectionDescriptor, bool)>> {
+    let descriptor_size = ewf2::SECTION_DESCRIPTOR_SIZE as u64;
+    if offset < ewf2::FILE_HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let buf = read_exact_at(file, offset, descriptor_size)?;
+    let desc = ewf2::SectionDescriptor::parse(&buf, offset)?;
+    let intact = validate_present_adler32_checksum(&buf, 60, 60, "EWF2 section descriptor").is_ok();
+    let data_offset = ewf2_trailing_data_offset(&desc);
+    let data_end = data_offset.checked_add(desc.data_size);
+    let valid = desc.descriptor_size == ewf2::SECTION_DESCRIPTOR_SIZE as u32
+        && u64::from(desc.padding_size) <= desc.data_size
+        && data_end.is_some_and(|end| end <= offset)
+        && (desc.previous_offset == 0
+            || (desc.previous_offset < offset
+                && desc
+                    .previous_offset
+                    .checked_add(descriptor_size)
+                    .is_some_and(|end| end <= data_offset)));
+    let consistent = valid
+        && data_end == Some(offset)
+        && !matches!(desc.section_type, ewf2::SectionType::Unknown(_));
+    Ok(((intact && valid) || consistent).then_some((desc, intact)))
+}
+
+/// Searches back from `below` for the nearest descriptor with a stored,
+/// matching checksum whose chain of intact descriptors reaches the start of the
+/// segment. Returns its offset and the sections of that chain.
+fn find_intact_ewf2_chain_below(
+    file: &mut dyn SegmentReader,
+    below: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Option<(u64, Vec<Ewf2Section>)>> {
+    const BLOCK: u64 = 1 << 20;
+    // Each candidate walks a chain; bounding them keeps crafted input cheap.
+    const MAXIMUM_CANDIDATES: usize = 256;
+    let descriptor_size = ewf2::SECTION_DESCRIPTOR_SIZE as u64;
+    let lowest = ewf2::FILE_HEADER_SIZE as u64;
+    let mut candidates_tried = 0;
+    let mut block_end = below.saturating_add(descriptor_size - 1);
+    while block_end >= lowest + descriptor_size {
+        let block_start = block_end.saturating_sub(BLOCK).max(lowest);
+        let bytes = read_exact_at(file, block_start, block_end - block_start)?;
+        let candidates = bytes
+            .len()
+            .saturating_sub(ewf2::SECTION_DESCRIPTOR_SIZE - 1);
+        for position in (0..candidates).rev() {
+            let Some(window) = bytes.get(position..position + ewf2::SECTION_DESCRIPTOR_SIZE) else {
+                continue;
+            };
+            // Cheap filters first: the descriptor size field, then the checksum.
+            if window.get(24..28) != Some(&[64, 0, 0, 0][..]) {
+                continue;
+            }
+            let stored = read_array::<4>(window, 60).map(u32::from_le_bytes)?;
+            if stored == 0 || window.get(..60).map(adler32) != Some(stored) {
+                continue;
+            }
+            let at = block_start + position as u64;
+            if at >= below {
+                continue;
+            }
+            candidates_tried += 1;
+            if candidates_tried > MAXIMUM_CANDIDATES {
+                return Ok(None);
+            }
+            // A quiet walk: only an intact chain is accepted here.
+            let mut probe = Leniency::new(OpenStrictness::Lenient);
+            if let Ewf2Walk::Complete(sections) =
+                walk_ewf2_chain_back(file, at, segment_index, &mut probe)?
+                && probe.into_defects().is_empty()
+            {
+                leniency.record(
+                    DefectKind::BrokenSectionChain,
+                    Some(segment_index),
+                    Some(at),
+                    format!(
+                        "the section chain was found again at the intact descriptor at {at}; \
+                         the bytes from {} to {below} could not be interpreted",
+                        at + descriptor_size
+                    ),
+                );
+                return Ok(Some((at, sections)));
+            }
+        }
+        if block_start == lowest {
+            break;
+        }
+        block_end = block_start + descriptor_size - 1;
+    }
+    Ok(None)
+}
+
+/// The sector table that a truncated segment ends in, right after the intact
+/// sector data descriptor at `previous`, when its header checksum matches.
+fn salvage_truncated_ewf2_table(
+    file: &mut dyn SegmentReader,
+    previous: u64,
+    file_len: u64,
+) -> Result<Option<Ewf2Section>> {
+    let data_offset = previous.saturating_add(ewf2::SECTION_DESCRIPTOR_SIZE as u64);
+    let data_size = file_len.saturating_sub(data_offset);
+    if data_size < EWF2_TABLE_HEADER_V2_SIZE {
+        return Ok(None);
+    }
+    let header = read_exact_at(file, data_offset, EWF2_TABLE_HEADER_V2_SIZE)?;
+    let stored = u32::from_le_bytes(read_array(&header, 16)?);
+    if stored == 0 || header.get(..16).map(adler32) != Some(stored) {
+        return Ok(None);
+    }
+    Ok(Some(Ewf2Section {
+        desc: ewf2::SectionDescriptor {
+            section_type: ewf2::SectionType::SectorTable,
+            data_flags: 0,
+            previous_offset: previous,
+            data_size,
+            descriptor_size: 0,
+            padding_size: 0,
+            data_integrity_hash: [0; 16],
+            offset: file_len,
+            has_integrity_hash: false,
+            encrypted: false,
+        },
+        data_offset,
+        data_size,
+        layout: Ewf2SectionLayout::TrailingDescriptor,
+        damaged_data: true,
+        salvaged: true,
+    }))
+}
+
+/// Checks a section's optional MD5 integrity hash. Strict opening fails on a
+/// mismatch; lenient opening records it and marks the section's data damaged.
+fn ewf2_section_data_is_damaged(
+    file: &mut dyn SegmentReader,
+    desc: ewf2::SectionDescriptor,
+    data_offset: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<bool> {
+    match validate_ewf2_section_integrity_hash(file, desc, data_offset) {
+        Ok(()) => Ok(false),
+        Err(error) => {
+            leniency.tolerate(
+                error,
+                DefectKind::ChecksumMismatch,
+                segment_index,
+                desc.offset,
+                "the section's data is treated as unverified",
+            )?;
+            Ok(true)
+        }
+    }
 }
 
 fn scan_ewf2_leading_sections(
@@ -4431,6 +4929,8 @@ fn scan_ewf2_leading_sections(
             data_offset,
             data_size: desc.data_size,
             layout: Ewf2SectionLayout::LeadingDescriptor,
+            damaged_data: false,
+            salvaged: false,
         });
         if is_terminal_ewf2_section(section_type) {
             return Ok(Some(sections));
@@ -4518,6 +5018,8 @@ fn scan_ewf2_trailing_sections(
             data_offset,
             data_size: desc.data_size,
             layout: Ewf2SectionLayout::TrailingDescriptor,
+            damaged_data: false,
+            salvaged: false,
         });
         if previous_offset == 0 {
             sections.reverse();
@@ -5175,6 +5677,11 @@ fn parse_ewf2_ranges(
             )
         })
         .collect();
+    // Sector data whose integrity hash failed may hold damaged chunks: each
+    // must verify itself.
+    let segment_data_damaged = sections.iter().any(|section| {
+        section.damaged_data && section.desc.section_type == ewf2::SectionType::SectorData
+    });
     let mut ranges = Vec::new();
     let mut rejected_chunks = Vec::new();
     let mut expected_next = expected_first_chunk;
@@ -5213,11 +5720,11 @@ fn parse_ewf2_ranges(
                 actual: data.len(),
             },
         )?)?;
-        let entry_count = u64::from(header.entry_count);
+        let mut entry_count = u64::from(header.entry_count);
         if entry_count == 0 && header_check.is_ok() {
             continue;
         }
-        let entries_bytes = entry_count
+        let mut entries_bytes = entry_count
             .checked_mul(ewf2::TABLE_ENTRY_SIZE as u64)
             .ok_or_else(|| EwfError::Malformed("EWF2 table entry bytes overflow".into()))?;
         let table_header_and_padding_size = match section.layout {
@@ -5237,13 +5744,28 @@ fn parse_ewf2_ranges(
             .data_offset
             .checked_add(table_header_and_padding_size)
             .ok_or_else(|| EwfError::Malformed("EWF2 table entry offset overflow".into()))?;
-        let entries_end = entries_offset
+        let mut entries_end = entries_offset
             .checked_add(entries_bytes)
             .ok_or_else(|| EwfError::Malformed("EWF2 table entry range overflow".into()))?;
         let section_end = section
             .data_offset
             .checked_add(section.data_size)
             .ok_or_else(|| EwfError::Malformed("EWF2 table section range overflow".into()))?;
+        // The end of the segment cut a salvaged table short: keep the entries
+        // that are complete, unverified, if the table continues the previous one.
+        let cut_short = section.salvaged;
+        if cut_short {
+            let present =
+                section_end.saturating_sub(entries_offset) / ewf2::TABLE_ENTRY_SIZE as u64;
+            if header_check.is_err() || header.first_chunk != expected_next || present == 0 {
+                continue;
+            }
+            if present < entry_count {
+                entry_count = present;
+                entries_bytes = present * ewf2::TABLE_ENTRY_SIZE as u64;
+                entries_end = entries_offset + entries_bytes;
+            }
+        }
         if entries_end > section_end {
             let error = EwfError::Malformed("EWF2 table entries exceed section".into());
             leniency.tolerate(
@@ -5255,9 +5777,10 @@ fn parse_ewf2_ranges(
             )?;
             continue;
         }
-        let has_footer = entries_end
-            .checked_add(EWF2_TABLE_FOOTER_SIZE)
-            .is_some_and(|footer_end| footer_end <= section_end);
+        let has_footer = !cut_short
+            && entries_end
+                .checked_add(EWF2_TABLE_FOOTER_SIZE)
+                .is_some_and(|footer_end| footer_end <= section_end);
         let entries_check = if has_footer {
             validate_present_table_entries_checksum(
                 file,
@@ -5296,8 +5819,18 @@ fn parse_ewf2_ranges(
                  the previous table, so it was used",
             )?;
         }
+        let entries_check = if cut_short {
+            Err(EwfError::Malformed(format!(
+                "EWF2 sector table is cut short by the end of the segment after {entry_count} \
+                 of {} entries",
+                header.entry_count
+            )))
+        } else {
+            entries_check
+        };
         let entries_verified = match entries_check {
-            Ok(()) => true,
+            Ok(()) if !segment_data_damaged => true,
+            Ok(()) => false,
             Err(error) => {
                 leniency.tolerate(
                     error,

@@ -6503,7 +6503,7 @@ fn image_open_rejects_overlapping_ewf2_sector_tables() {
 fn image_open_rejects_ewf2_section_bad_descriptor_checksum() {
     let file = writer_ex01_with_bad_descriptor_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6628,7 +6628,7 @@ fn image_open_parses_synthetic_ewf2_restart_data_section() {
 fn image_open_rejects_ewf2_section_integrity_hash_mismatch() {
     let file = synthetic_ex01_leading_restart_data_with_integrity(b"bad section hash", true);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,

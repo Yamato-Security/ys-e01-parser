@@ -930,3 +930,98 @@ fn corruption_probes_report_damage_that_lenient_opening_goes_past() {
     assert!(ewf_image::check_file_corruption(&written.path).unwrap());
     assert!(ewf_image::check_segment_files_corruption([&written.path]).unwrap());
 }
+
+#[test]
+fn truncated_ewf2_segment_keeps_the_complete_entries_of_its_last_table() {
+    let written = ex01(8);
+    let table = ewf2_section(&sections(&written.path), 0x04);
+    // Five complete entries and three bytes of the sixth remain.
+    truncate(&written.path, table.data_offset + 32 + 16 * 5 + 3);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert!(!image.info().acquisition_complete);
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::UnverifiedChunkTable,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(readable_chunks(&image, &written.data), 5);
+}
+
+#[test]
+fn truncation_after_the_ewf2_table_keeps_every_chunk() {
+    let written = ex01(4);
+    let md5 = ewf2_section(&sections(&written.path), 0x08);
+    truncate(&written.path, md5.data_offset + 7);
+
+    let image = Image::open(&written.path).unwrap();
+    assert!(!image.info().acquisition_complete);
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::BrokenSectionChain
+        ]
+    );
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn truncation_in_ewf2_sector_data_leaves_the_chunks_unavailable() {
+    let written = ex01(4);
+    let data = ewf2_section(&sections(&written.path), 0x03);
+    truncate(&written.path, data.data_offset + data.data_size / 2);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::TruncatedSegment,
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::ChunksUnavailable
+        ]
+    );
+    assert_eq!(readable_chunks(&image, &written.data), 0);
+}
+
+#[test]
+fn damaged_ewf2_descriptor_with_consistent_sizes_is_followed() {
+    let written = ex01(4);
+    let data = ewf2_section(&sections(&written.path), 0x03);
+    // A padding byte of the sector data descriptor.
+    flip(&written.path, data.descriptor_offset + 50);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(read_all(&image), written.data);
+}
+
+#[test]
+fn damaged_ewf2_descriptor_is_skipped_by_finding_the_chain_again() {
+    let written = ex01(4);
+    let md5 = ewf2_section(&sections(&written.path), 0x08);
+    // The MD5 descriptor's link to the table descriptor.
+    flip(&written.path, md5.descriptor_offset + 9);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::BrokenSectionChain
+        ]
+    );
+    assert!(image.md5_hash().is_none());
+    assert!(image.sha1_hash().is_some());
+    assert!(image.info().acquisition_complete);
+    assert_eq!(read_all(&image), written.data);
+}
