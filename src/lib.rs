@@ -15,13 +15,17 @@
 // PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
 // and limitations under the RPL.
 
-//! Rust library for reading and writing Expert Witness Format forensic images.
+//! Rust library for reading Expert Witness Format forensic images, and with the
+//! `writer` feature, writing them.
 //!
 //! `ewf_image` provides direct Rust APIs for working with Expert Witness Format
 //! images. It can open physical, logical, SMART, and EWF2 segment families,
-//! expose metadata and stored hashes, read the logical media stream, walk
-//! logical single-file catalogs, and create EWF output. An optional acquisition
-//! CLI is available; a filesystem mount layer is not currently implemented.
+//! expose metadata and stored hashes, read the logical media stream, and walk
+//! logical single-file catalogs; with the `writer` feature, it also creates EWF
+//! output and acquires devices. Images open leniently by default: damage that
+//! the data can still be checked without is gone past and reported by
+//! `Image::lenient_findings`, and a chunk that cannot be verified fails when it
+//! is read. Juntei mounts the images it reads with ys-vhdx-mount.
 //!
 //! # Terminology
 //!
@@ -123,9 +127,10 @@
 //!
 //! # Streaming acquisition
 //!
-//! [`AcquisitionWriter`] seals physical E01 segments as input arrives and can
-//! resume sealed checkpoints without rewriting them. It requires a known,
-//! sector-aligned source size and a filesystem supporting hard links.
+//! `AcquisitionWriter` (with the `writer` feature) seals physical E01 segments as
+//! input arrives and can resume sealed checkpoints without rewriting them. It
+//! requires a known, sector-aligned source size and a filesystem supporting hard
+//! links.
 //!
 //! ```no_run
 //! use std::fs::File;
