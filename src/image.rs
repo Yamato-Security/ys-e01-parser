@@ -3344,7 +3344,7 @@ fn place_ewf1_segments_from_end(
         }
         end = Some(start);
     }
-    for segment in remaining {
+    for segment in remaining.iter().filter(|segment| segment.chunk_count > 0) {
         leniency.record(
             DefectKind::ChunksUnavailable,
             Some(segment.segment_index),
