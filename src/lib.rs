@@ -165,6 +165,9 @@
 //! Secondary/shadow target mirroring is supported by the file-backed writer.
 //! Base-plus-overlay delta/shadow images are not implemented.
 
+// Without the writer, the helpers only it uses are unused; with --all-features (CI), unused code
+// is still an error.
+#![cfg_attr(not(feature = "writer"), allow(dead_code))]
 #![forbid(unsafe_code)]
 
 mod codepage;
@@ -192,6 +195,7 @@ mod source;
 mod types;
 #[cfg(feature = "verify")]
 mod verify;
+#[cfg(feature = "writer")]
 mod writer;
 
 pub use encryption::{EncryptionInfo, EncryptionMethod, EwfPassword};
@@ -230,6 +234,7 @@ pub use types::{
     SingleFilePermission, SingleFilePermissionGroup, SingleFileSource, SingleFileSubject,
     SingleFilesAuxTables, SingleFilesInfo, StoredHashes,
 };
+#[cfg(feature = "writer")]
 pub use writer::{
     AcquisitionCheckpoint, AcquisitionOperationPhase, AcquisitionOperationProgress,
     AcquisitionOptions, AcquisitionOutcome, AcquisitionProgress, AcquisitionReadOptions,
