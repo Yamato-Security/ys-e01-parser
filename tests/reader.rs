@@ -6278,7 +6278,7 @@ fn image_open_rejects_mismatched_ewf2_compression_methods_across_segments() {
     )
     .unwrap();
 
-    let err = ewf_image::Image::open(&first).unwrap_err();
+    let err = open_strict(&first).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -6297,7 +6297,7 @@ fn image_open_rejects_mismatched_ewf2_format_versions_across_segments() {
     .unwrap();
     std::fs::write(&second, second_segment).unwrap();
 
-    let err = ewf_image::Image::open(&first).unwrap_err();
+    let err = open_strict(&first).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }

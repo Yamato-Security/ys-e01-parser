@@ -1531,3 +1531,28 @@ fn damaged_volume_without_a_copy_is_confirmed_by_a_partial_final_chunk() {
         assert!(error.to_string().contains("final chunk"), "{error}");
     }
 }
+
+#[test]
+fn damaged_ewf2_file_header_of_a_later_segment_is_read_like_the_first() {
+    let written = write_image(
+        "image.Ex01",
+        WriteFormat::Ewf2Physical,
+        WriteCompression::Zlib,
+        &media(8),
+        |options| options.maximum_segment_size = Some(4_000),
+    );
+    let image = Image::open(&written.path).unwrap();
+    assert!(image.number_of_segments() >= 2);
+    let second = image.segment_filename(1).unwrap().to_path_buf();
+    drop(image);
+    // The compression method in the second segment's file header.
+    modify(&second, |bytes| bytes[10] = 2);
+
+    assert!(open_strict(&written.path).is_err());
+    let image = Image::open(&written.path).unwrap();
+    let findings = image.lenient_findings();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, IntegrityFindingKind::LenientOpen);
+    assert_eq!(findings[0].segment_index, Some(1));
+    assert_eq!(read_all(&image), written.data);
+}

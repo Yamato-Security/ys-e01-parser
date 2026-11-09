@@ -628,7 +628,7 @@ impl Image {
 
         for (segment_index, path) in paths.iter().enumerate() {
             statistics.record_segment_parse();
-            let (parsed, encryption_context, observed_encryption_info) = {
+            let (mut parsed, encryption_context, observed_encryption_info) = {
                 let file = segments.file_mut(segment_index, path)?;
                 let encryption_metadata = ewf1::read_xways_encryption(file.as_reader_mut())?;
                 let observed_encryption_info =
@@ -719,10 +719,28 @@ impl Image {
                     ewf1_geometry_unverified = None;
                 }
             }
-            validate_ewf2_header_profile(
+            if let Err(error) = validate_ewf2_header_profile(
                 &mut expected_ewf2_header_profile,
                 parsed.ewf2_header_profile,
-            )?;
+            ) {
+                // A later segment whose file header disagrees on the format
+                // version or compression method is read like the first one.
+                let Some(expected) = expected_ewf2_header_profile.filter(|_| segment_index > 0)
+                else {
+                    return Err(error);
+                };
+                leniency.tolerate(
+                    error,
+                    DefectKind::DamagedFileHeader,
+                    segment_index,
+                    0,
+                    "the first segment's format version and compression method were used",
+                )?;
+                for range in &mut parsed.ranges {
+                    range.ewf2_compression_method =
+                        Some(compression_method_code(expected.compression_method));
+                }
+            }
             if let Some(device_information) = parsed.ewf2_device_information.as_deref() {
                 remember_ewf2_metadata_payload(
                     &mut expected_ewf2_device_information,
