@@ -4506,7 +4506,11 @@ fn scan_ewf1_sections(
                     repaired.section_type
                 ),
             )?;
-            desc = repaired;
+            // The compression marker shares the damaged bytes; it is not used.
+            desc = ewf1::SectionDescriptor {
+                compression_method: None,
+                ..repaired
+            };
         }
         let data_size = match desc.data_size() {
             Ok(size) => size,

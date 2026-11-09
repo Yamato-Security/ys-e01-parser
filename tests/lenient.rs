@@ -1410,3 +1410,35 @@ fn damaged_leading_ewf2_descriptor_with_a_wrong_size_ends_the_chain() {
     assert_eq!(image.media_size(), data.len() as u64);
     assert_eq!(readable_chunks(&image, &data), 0);
 }
+
+#[test]
+fn damaged_compression_marker_of_a_repaired_descriptor_is_not_used() {
+    let written = write_image(
+        "image.E01",
+        WriteFormat::Ewf1Physical,
+        WriteCompression::Zlib,
+        &media(2),
+        |options| {
+            options
+                .metadata
+                .header_values
+                .insert("case_number".into(), "case-17".into());
+        },
+    );
+    let header = descriptor_offset(&written.path, 0, "header");
+    modify(&written.path, |bytes| {
+        let marker = usize::try_from(header).unwrap() + 32;
+        bytes[marker..marker + 4].copy_from_slice(&[0xff; 4]);
+    });
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(
+        image.header_value("case_number").as_deref(),
+        Some("case-17")
+    );
+    assert_eq!(read_all(&image), written.data);
+}
