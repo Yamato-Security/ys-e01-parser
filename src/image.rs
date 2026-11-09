@@ -4558,6 +4558,11 @@ fn scan_ewf1_sections(
             if !leniency.is_lenient() {
                 return Err(error);
             }
+            // A type name a bit or two away from exactly one known name is
+            // restored; the section's own checksums still guard its contents.
+            if let Some(name) = restore_ewf1_section_name(&buf) {
+                desc.section_type = name.into();
+            }
             let Some(repaired) = repair_ewf1_descriptor(file, &desc, file_len)? else {
                 leniency.tolerate(
                     error,
@@ -4696,6 +4701,32 @@ const EWF1_SECTION_NAMES: [&[u8]; 18] = [
     b"table2", b"next", b"done", b"hash", b"digest", b"xhash", b"error2", b"session", b"ltree",
     b"ltypes",
 ];
+
+/// The known section name that the damaged 16-byte type field at the start of
+/// `descriptor` is closest to, when at most two bits differ from it and at
+/// least two more bits differ from every other known name. `None` for a known
+/// name, which needs no restoring.
+fn restore_ewf1_section_name(descriptor: &[u8]) -> Option<&'static str> {
+    let field = descriptor.get(..16)?;
+    let distance = |name: &[u8]| -> u32 {
+        field
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| (byte ^ name.get(index).copied().unwrap_or(0)).count_ones())
+            .sum()
+    };
+    let mut ranked: Vec<(u32, &[u8])> = EWF1_SECTION_NAMES
+        .iter()
+        .map(|name| (distance(name), *name))
+        .collect();
+    ranked.sort_unstable();
+    let [(best, name), (second, _), ..] = ranked.as_slice() else {
+        return None;
+    };
+    (*best > 0 && *best <= 2 && *second >= best + 2)
+        .then(|| std::str::from_utf8(name).ok())
+        .flatten()
+}
 
 /// After a descriptor that cannot be followed, searches forward for the nearest
 /// descriptor with a stored, matching checksum from which a chain of intact

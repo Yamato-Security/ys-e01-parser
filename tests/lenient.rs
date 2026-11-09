@@ -1556,3 +1556,21 @@ fn damaged_ewf2_file_header_of_a_later_segment_is_read_like_the_first() {
     assert_eq!(findings[0].segment_index, Some(1));
     assert_eq!(read_all(&image), written.data);
 }
+
+#[test]
+fn damaged_section_name_close_to_one_known_name_is_restored() {
+    let written = e01(WriteCompression::Zlib, 3);
+    let volume = descriptor_offset(&written.path, 0, "volume");
+    // "volume" becomes "voluMe".
+    modify(&written.path, |bytes| {
+        bytes[usize::try_from(volume).unwrap() + 4] ^= 0x20;
+    });
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [IntegrityFindingKind::StructureChecksumMismatch]
+    );
+    assert_eq!(image.sections()[0].kind, SectionKind::Ewf1("volume".into()));
+    assert_eq!(read_all(&image), written.data);
+}
