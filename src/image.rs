@@ -4449,7 +4449,8 @@ fn scan_ewf1_sections(
     segment_index: usize,
     leniency: &mut Leniency,
 ) -> Result<Ewf1Chain> {
-    const REST_IGNORED: &str = "the rest of the segment is ignored";
+    const REST_IGNORED: &str =
+        "the sections after it are used only where the chain can be found again";
     let file_len = file.segment_len()?;
     let mut sections = Vec::new();
     let mut offset = ewf1::FILE_HEADER_SIZE as u64;
@@ -4490,10 +4491,17 @@ fn scan_ewf1_sections(
                     DefectKind::BrokenSectionChain,
                     segment_index,
                     offset,
-                    "its size and next offset do not agree, so the rest of the segment is \
-                     ignored",
+                    "its size and next offset do not agree, so the sections after it are used \
+                     only where the chain can be found again",
                 )?;
-                return incomplete(sections);
+                return find_ewf1_chain_again(
+                    file,
+                    sections,
+                    offset,
+                    file_len,
+                    segment_index,
+                    leniency,
+                );
             };
             leniency.tolerate(
                 error,
@@ -4522,7 +4530,14 @@ fn scan_ewf1_sections(
                     offset,
                     REST_IGNORED,
                 )?;
-                return incomplete(sections);
+                return find_ewf1_chain_again(
+                    file,
+                    sections,
+                    offset,
+                    file_len,
+                    segment_index,
+                    leniency,
+                );
             }
         };
         let data_offset = descriptor_end;
@@ -4571,7 +4586,14 @@ fn scan_ewf1_sections(
                 offset,
                 REST_IGNORED,
             )?;
-            return incomplete(sections);
+            return find_ewf1_chain_again(
+                file,
+                sections,
+                offset,
+                file_len,
+                segment_index,
+                leniency,
+            );
         }
         if next < data_end {
             leniency.tolerate(
@@ -4581,7 +4603,141 @@ fn scan_ewf1_sections(
                 offset,
                 REST_IGNORED,
             )?;
-            return incomplete(sections);
+            return find_ewf1_chain_again(
+                file,
+                sections,
+                offset,
+                file_len,
+                segment_index,
+                leniency,
+            );
+        }
+        offset = next;
+    }
+}
+
+/// EWF1 section names that the reader knows; a resynchronized chain must
+/// start at one of them.
+const EWF1_SECTION_NAMES: [&[u8]; 18] = [
+    b"header", b"header2", b"xheader", b"volume", b"disk", b"data", b"sectors", b"table",
+    b"table2", b"next", b"done", b"hash", b"digest", b"xhash", b"error2", b"session", b"ltree",
+    b"ltypes",
+];
+
+/// After a descriptor that cannot be followed, searches forward for the nearest
+/// descriptor with a stored, matching checksum from which a chain of intact
+/// descriptors ends in a done or next descriptor at the very end of the
+/// segment, and appends that chain's sections. The bytes in between are
+/// skipped. Requiring the chain to end exactly at the end of the segment keeps
+/// descriptors that merely appear inside chunk data (for example of an EWF
+/// image stored on the acquired media) from being taken for the image's own.
+/// The chain stays incomplete: the skipped bytes may have held tables.
+fn find_ewf1_chain_again(
+    file: &mut dyn SegmentReader,
+    mut sections: Vec<Section>,
+    broken_at: u64,
+    file_len: u64,
+    segment_index: usize,
+    leniency: &mut Leniency,
+) -> Result<Ewf1Chain> {
+    const BLOCK: u64 = 1 << 20;
+    // Each candidate walks a chain; bounding them keeps crafted input cheap.
+    const MAXIMUM_CANDIDATES: usize = 256;
+    let descriptor_size = ewf1::SECTION_DESCRIPTOR_SIZE as u64;
+    let mut candidates_tried = 0;
+    let mut block_start = broken_at.saturating_add(1);
+    'search: while block_start.saturating_add(descriptor_size) <= file_len {
+        let block_end = block_start
+            .saturating_add(BLOCK)
+            .saturating_add(descriptor_size - 1)
+            .min(file_len);
+        let bytes = read_exact_at(file, block_start, block_end - block_start)?;
+        let candidates = bytes
+            .len()
+            .saturating_sub(ewf1::SECTION_DESCRIPTOR_SIZE - 1);
+        for position in 0..candidates {
+            let Some(window) = bytes.get(position..position + ewf1::SECTION_DESCRIPTOR_SIZE) else {
+                continue;
+            };
+            // Cheap filters first: a known section name, then the checksum.
+            let named = EWF1_SECTION_NAMES
+                .iter()
+                .any(|name| window.starts_with(name) && window.get(name.len()) == Some(&0));
+            if !named {
+                continue;
+            }
+            let stored = u32::from_le_bytes(read_array(window, 72)?);
+            if stored == 0 || window.get(..72).map(adler32) != Some(stored) {
+                continue;
+            }
+            candidates_tried += 1;
+            if candidates_tried > MAXIMUM_CANDIDATES {
+                break 'search;
+            }
+            let found = block_start + position as u64;
+            if let Some(later) = intact_ewf1_chain_to_end(file, found, file_len)? {
+                leniency.record(
+                    DefectKind::BrokenSectionChain,
+                    Some(segment_index),
+                    Some(found),
+                    format!(
+                        "the section chain was found again at the intact descriptor at {found}; \
+                         the bytes from {broken_at} to {found} could not be interpreted"
+                    ),
+                );
+                sections.extend(later);
+                break 'search;
+            }
+        }
+        if block_end >= file_len {
+            break;
+        }
+        block_start = block_end - (descriptor_size - 1);
+    }
+    Ok(Ewf1Chain {
+        sections,
+        complete: false,
+        partial: None,
+    })
+}
+
+/// The sections of the chain starting at `offset`, when every descriptor in it
+/// is intact and it ends in a done or next descriptor at the end of the file.
+fn intact_ewf1_chain_to_end(
+    file: &mut dyn SegmentReader,
+    mut offset: u64,
+    file_len: u64,
+) -> Result<Option<Vec<Section>>> {
+    let descriptor_size = ewf1::SECTION_DESCRIPTOR_SIZE as u64;
+    let mut sections = Vec::new();
+    loop {
+        if !intact_ewf1_descriptor_at(file, offset, file_len)? {
+            return Ok(None);
+        }
+        let bytes = read_exact_at(file, offset, descriptor_size)?;
+        let desc = ewf1::SectionDescriptor::parse(&bytes, offset)?;
+        let Ok(data_size) = desc.data_size() else {
+            return Ok(None);
+        };
+        let data_offset = offset + descriptor_size;
+        let Some(data_end) = data_offset
+            .checked_add(data_size)
+            .filter(|end| *end <= file_len)
+        else {
+            return Ok(None);
+        };
+        let terminal = matches!(desc.section_type.as_str(), "done" | "next");
+        let next = desc.next;
+        sections.push(Section {
+            desc,
+            data_offset,
+            data_size,
+        });
+        if terminal {
+            return Ok((data_offset == file_len || data_end == file_len).then_some(sections));
+        }
+        if next <= offset || next < data_end {
+            return Ok(None);
         }
         offset = next;
     }
@@ -5824,8 +5980,7 @@ fn parse_ewf1_ranges(
                 (profile.lenient && base_offset != 0)
                     .then(|| {
                         sections.iter().find(|section| {
-                            section.desc.offset == base_offset
-                                || sectors_section_contains_offset(section, base_offset)
+                            section.desc.offset == base_offset || section.data_offset == base_offset
                         })
                     })
                     .flatten()
@@ -5878,6 +6033,12 @@ fn parse_ewf1_ranges(
                 .checked_add(sectors.data_size)
                 .ok_or_else(|| EwfError::Malformed("EWF1 sectors range overflow".into()))?;
             (base_offset, sectors.data_offset, data_end)
+        } else if profile.lenient && base_offset != 0 && base_offset < section.desc.offset {
+            // The sectors section the table's base names was lost with a damaged
+            // descriptor. Its chunk data still lies between that base and this
+            // table, which writers place right after it; the entries themselves
+            // are checked, so only the end of the last chunk is inferred.
+            (base_offset, base_offset, section.desc.offset)
         } else {
             let resident_data_start = if table_resident_without_entries_checksum {
                 layout.entries_end

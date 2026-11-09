@@ -524,16 +524,83 @@ fn damaged_sectors_type_name_still_locates_the_chunks() {
 }
 
 #[test]
-fn damaged_descriptor_with_inconsistent_offsets_stops_the_segment() {
+fn damaged_descriptor_with_inconsistent_offsets_is_skipped_by_finding_the_chain_again() {
     let written = e01(WriteCompression::Zlib, 3);
     let table = descriptor_offset(&written.path, 0, "table");
-    modify(&written.path, |bytes| {
-        let start = usize::try_from(table).unwrap() + 16;
+    let table2 = descriptor_offset(&written.path, 0, "table2");
+    damage_next_and_size(&written.path, table);
+
+    let image = Image::open(&written.path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::BrokenSectionChain
+        ]
+    );
+    assert_eq!(image.lenient_findings()[0].segment_offset, Some(table));
+    // The chain continues at table2, whose entries locate the chunks.
+    assert_eq!(image.lenient_findings()[1].segment_offset, Some(table2));
+    assert_eq!(read_all(&image), written.data);
+}
+
+fn damage_next_and_size(path: &Path, descriptor: u64) {
+    modify(path, |bytes| {
+        let start = usize::try_from(descriptor).unwrap() + 16;
         // Both the next offset and the size, so neither leads anywhere.
         bytes[start..start + 16].copy_from_slice(&[0x7f; 16]);
     });
+}
 
-    let image = Image::open(&written.path).unwrap();
+#[test]
+fn damaged_sectors_descriptor_is_skipped_and_its_chunks_still_located() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build::libewf().write(&data);
+    damage_next_and_size(&path, built_section(&path, "sectors").descriptor_offset);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::BrokenSectionChain
+        ]
+    );
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn damaged_volume_descriptor_is_skipped_and_the_data_copy_used() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build::libewf().write(&data);
+    damage_next_and_size(&path, built_section(&path, "volume").descriptor_offset);
+
+    let image = Image::open(&path).unwrap();
+    assert_eq!(
+        kinds(&image),
+        [
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegrityFindingKind::BrokenSectionChain
+        ]
+    );
+    assert_eq!(image.media_size(), data.len() as u64);
+    assert_eq!(read_all(&image), data);
+}
+
+#[test]
+fn chain_found_again_must_end_at_the_end_of_the_segment() {
+    let data = media(4);
+    let (_dir, path) = Ewf1Build {
+        table2: false,
+        ..Ewf1Build::libewf()
+    }
+    .write(&data);
+    damage_next_and_size(&path, built_section(&path, "table").descriptor_offset);
+    // Bytes after the done descriptor: the intact chain after the damaged
+    // table no longer ends at the end of the segment, so it is not taken.
+    modify(&path, |bytes| bytes.extend([0x55; 100]));
+
+    let image = Image::open(&path).unwrap();
     assert_eq!(
         kinds(&image),
         [
@@ -541,9 +608,8 @@ fn damaged_descriptor_with_inconsistent_offsets_stops_the_segment() {
             IntegrityFindingKind::UnverifiedChunkTable
         ]
     );
-    assert_eq!(image.lenient_findings()[0].segment_offset, Some(table));
-    // The tables are lost; the chunks are found by decoding them in order.
-    assert_eq!(read_all(&image), written.data);
+    // The table is lost; the chunks are found by decoding them in order.
+    assert_eq!(read_all(&image), data);
 }
 
 /// A single EWF1 segment laid out the way the common writers lay it out:
