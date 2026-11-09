@@ -21,6 +21,7 @@ use crate::decode::{
 use crate::encryption::EncryptionContext;
 use crate::format::{ewf1, ewf2};
 use crate::index::{LazyChunkIndex, TableRange, TableRangeKind};
+use crate::lenient::{Defect, DefectKind, Leniency};
 use crate::metadata::{
     Ewf2Geometry, detect_ewf1_header_profile, detect_ewf1_header2_profile, parse_error2_data,
     parse_ewf2_case_data, parse_ewf2_device_info, parse_ewf2_device_info_values,
@@ -97,6 +98,9 @@ struct ImageInner {
     table_page_cache: Mutex<TablePageCache>,
     statistics: Arc<ReaderStatisticsCollector>,
     checksum_errors: Mutex<Vec<SectorRange>>,
+    // Read only through the `verify` feature's integrity findings.
+    #[cfg_attr(not(feature = "verify"), allow(dead_code))]
+    defects: Vec<Defect>,
     read_zero_chunk_on_error: AtomicBool,
     abort_signaled: AtomicBool,
 }
@@ -595,6 +599,7 @@ impl Image {
         let mut expected_ewf2_case_data = None;
         let mut encryption_info = None;
         let mut encryption_contexts = Vec::with_capacity(paths.len());
+        let mut leniency = Leniency::new(options.strictness());
 
         for (segment_index, path) in paths.iter().enumerate() {
             statistics.record_segment_parse();
@@ -618,7 +623,7 @@ impl Image {
                         first_chunk: next_ewf1_chunk,
                         inherited_media_geometry: expected_ewf1_media,
                     },
-                    options.strictness(),
+                    &mut leniency,
                     options.header_codepage(),
                     &statistics,
                 )?;
@@ -853,6 +858,7 @@ impl Image {
                 )),
                 statistics,
                 checksum_errors: Mutex::new(Vec::new()),
+                defects: leniency.into_defects(),
                 read_zero_chunk_on_error: AtomicBool::new(options.read_zero_chunk_on_error()),
                 abort_signaled: AtomicBool::new(false),
             }),
@@ -865,6 +871,12 @@ impl Image {
             image.read_data_chunk(0)?;
         }
         Ok(image)
+    }
+
+    /// Defects recorded while opening.
+    #[cfg(feature = "verify")]
+    pub(crate) fn defects(&self) -> Vec<Defect> {
+        self.inner.defects.clone()
     }
 
     /// Returns parsed image metadata and geometry.
@@ -2872,16 +2884,20 @@ enum Ewf2SectionLayout {
 fn parse_ewf1_segment(
     file: &mut dyn SegmentReader,
     segment_index: usize,
-    first_chunk: u64,
-    inherited_media_geometry: Option<Ewf1MediaGeometry>,
+    context: Ewf1SegmentContext,
     profile_hint: FormatProfile,
     header_codepage: HeaderCodepage,
+    leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<ParsedSegment> {
     let mut header = [0; ewf1::FILE_HEADER_SIZE];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
     let file_header = ewf1::FileHeader::parse(&header)?;
+    let Ewf1SegmentContext {
+        first_chunk,
+        inherited_media_geometry,
+    } = context;
 
     let sections = scan_ewf1_sections(file)?;
     let compression_method = detect_ewf1_compression_method(file_header, &sections)?;
@@ -2971,90 +2987,73 @@ fn parse_ewf1_segment(
     let mut sessions = Vec::new();
     let mut tracks = Vec::new();
     for section in &sections {
-        match section.desc.section_type.as_str() {
-            "header" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let payload = ewf1_metadata_payload(&data, compression_method)?;
-                let text = decode_header_bytes(&payload, header_codepage);
-                if !format_profile_detected_from_header2
-                    && apply_detected_ewf1_format_profile(
-                        &mut format_profile,
-                        detect_ewf1_header_profile(&text, 1),
-                    )
-                {
-                    format_profile_hint_only = false;
-                }
-                parse_header_data(&payload, header_codepage, &mut metadata);
-            }
-            "header2" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let payload = ewf1_metadata_payload(&data, compression_method)?;
-                if apply_detected_ewf1_format_profile(
-                    &mut format_profile,
-                    detect_ewf1_header2_profile(&payload),
-                ) {
-                    format_profile_hint_only = false;
-                    format_profile_detected_from_header2 = true;
-                }
-                parse_header2_data(&payload, &mut metadata);
-            }
-            "xheader" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let payload = ewf1_metadata_payload(&data, compression_method)?;
-                parse_xheader_data(&payload, &mut metadata);
-            }
-            "error2" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                acquisition_errors.extend(parse_error2_data(&data)?);
-            }
-            "session" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let sector_count = volume
-                    .as_ref()
-                    .map(|volume| volume.sector_count)
-                    .or_else(|| inherited_media_geometry.map(|geometry| geometry.sector_count))
-                    .ok_or_else(|| {
-                        EwfError::Malformed(
-                            "EWF1 session section has no media geometry to inherit".into(),
-                        )
-                    })?;
-                let parsed_sessions = parse_session_data(&data, 1, sector_count)?;
-                sessions.extend(parsed_sessions.sessions);
-                tracks.extend(parsed_sessions.tracks);
-            }
-            "hash" => {
-                validate_hash_section_size(section.data_size, EWF1_HASH_SECTION_SIZE, "EWF1 MD5")?;
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                validate_adler32_checksum(&data, 32, 32, "EWF1 MD5 hash")?;
-                if let Some(hash) = parse_nonzero_hash::<16>(&data) {
-                    insert_hash_value(&mut stored_hashes, "MD5", &hash)?;
-                }
-            }
-            "digest" => {
-                validate_hash_section_size(
-                    section.data_size,
-                    EWF1_DIGEST_SECTION_SIZE,
-                    "EWF1 digest",
-                )?;
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                validate_adler32_checksum(&data, 76, 76, "EWF1 digest")?;
-                if let Some(hash) = parse_nonzero_hash::<16>(&data[..16]) {
-                    insert_hash_value(&mut stored_hashes, "MD5", &hash)?;
-                }
-                if let Some(hash) = parse_nonzero_hash::<20>(&data[16..36]) {
-                    insert_hash_value(&mut stored_hashes, "SHA1", &hash)?;
-                }
-            }
-            "xhash" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let payload = ewf1_metadata_payload(&data, compression_method)?;
-                parse_xhash_data(&payload, &mut stored_hashes)?;
-            }
-            "ltree" => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_single_files(&mut single_files, Some(parse_ewf1_ltree_data(&data)?))?;
-            }
-            _ => {}
+        let section_type = section.desc.section_type.as_str();
+        if !matches!(
+            section_type,
+            "header"
+                | "header2"
+                | "xheader"
+                | "error2"
+                | "session"
+                | "hash"
+                | "digest"
+                | "xhash"
+                | "ltree"
+        ) {
+            continue;
+        }
+        // Fixed-size sections are checked before reading so that a damaged size
+        // never causes a large allocation.
+        let expected_size = match section_type {
+            "hash" => Some((EWF1_HASH_SECTION_SIZE, "EWF1 MD5")),
+            "digest" => Some((EWF1_DIGEST_SECTION_SIZE, "EWF1 digest")),
+            _ => None,
+        };
+        if let Some((expected, label)) = expected_size
+            && let Err(error) = validate_hash_section_size(section.data_size, expected, label)
+        {
+            leniency.tolerate(
+                error,
+                DefectKind::MetadataUnavailable,
+                segment_index,
+                section.desc.offset,
+                &format!("the {section_type} section's values are not used"),
+            )?;
+            continue;
+        }
+        let data = read_exact_at(file, section.data_offset, section.data_size)?;
+        let parsed = parse_ewf1_metadata_section(
+            section_type,
+            &data,
+            compression_method,
+            header_codepage,
+            leniency.is_lenient(),
+            &mut Ewf1MetadataTargets {
+                metadata: &mut metadata,
+                stored_hashes: &mut stored_hashes,
+                acquisition_errors: &mut acquisition_errors,
+                single_files: &mut single_files,
+                sessions: &mut sessions,
+                tracks: &mut tracks,
+                format_profile: &mut format_profile,
+                format_profile_hint_only: &mut format_profile_hint_only,
+                format_profile_detected_from_header2: &mut format_profile_detected_from_header2,
+            },
+            volume
+                .as_ref()
+                .map(|volume| volume.sector_count)
+                .or_else(|| inherited_media_geometry.map(|geometry| geometry.sector_count)),
+        );
+        match parsed {
+            Ok(()) => {}
+            Err(MetadataError::Damaged(error)) => leniency.tolerate(
+                error,
+                DefectKind::MetadataUnavailable,
+                segment_index,
+                section.desc.offset,
+                &format!("the {section_type} section's values are not used"),
+            )?,
+            Err(MetadataError::Fatal(error)) => return Err(error),
         }
     }
 
@@ -3117,6 +3116,146 @@ fn parse_ewf1_segment(
         ewf2_device_information: None,
         ewf2_case_data: None,
     })
+}
+
+/// Destinations for values parsed from EWF1 metadata sections.
+struct Ewf1MetadataTargets<'a> {
+    metadata: &'a mut EwfMetadata,
+    stored_hashes: &'a mut StoredHashes,
+    acquisition_errors: &'a mut Vec<AcquisitionError>,
+    single_files: &'a mut Option<SingleFilesInfo>,
+    sessions: &'a mut Vec<SectorRange>,
+    tracks: &'a mut Vec<SectorRange>,
+    format_profile: &'a mut FormatProfile,
+    format_profile_hint_only: &'a mut bool,
+    format_profile_detected_from_header2: &'a mut bool,
+}
+
+/// Separates damage that lenient opening may skip from errors that always
+/// fail opening, such as I/O errors and intact but conflicting hash references.
+enum MetadataError {
+    Damaged(EwfError),
+    Fatal(EwfError),
+}
+
+impl From<EwfError> for MetadataError {
+    fn from(error: EwfError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+fn damaged(error: EwfError) -> MetadataError {
+    match error {
+        EwfError::Malformed(_) | EwfError::BufferTooShort { .. } => MetadataError::Damaged(error),
+        other => MetadataError::Fatal(other),
+    }
+}
+
+/// Parses one EWF1 metadata section. Values are written to `targets` only once
+/// the whole section has parsed, so a damaged section contributes nothing.
+fn parse_ewf1_metadata_section(
+    section_type: &str,
+    data: &[u8],
+    compression_method: CompressionMethod,
+    header_codepage: HeaderCodepage,
+    lenient: bool,
+    targets: &mut Ewf1MetadataTargets<'_>,
+    sector_count: Option<u64>,
+) -> std::result::Result<(), MetadataError> {
+    let zstd_payload = compression_method == CompressionMethod::Zstd
+        && data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+    let payload = || -> std::result::Result<Vec<u8>, MetadataError> {
+        if lenient && !zstd_payload && zlib_payload_is_damaged(data) {
+            return Err(MetadataError::Damaged(EwfError::Malformed(format!(
+                "EWF1 {section_type} section is compressed but does not decompress"
+            ))));
+        }
+        Ok(ewf1_metadata_payload(data, compression_method)?)
+    };
+    match section_type {
+        "header" => {
+            let payload = payload()?;
+            let text = decode_header_bytes(&payload, header_codepage);
+            if !*targets.format_profile_detected_from_header2
+                && apply_detected_ewf1_format_profile(
+                    targets.format_profile,
+                    detect_ewf1_header_profile(&text, 1),
+                )
+            {
+                *targets.format_profile_hint_only = false;
+            }
+            parse_header_data(&payload, header_codepage, targets.metadata);
+        }
+        "header2" => {
+            let payload = payload()?;
+            if apply_detected_ewf1_format_profile(
+                targets.format_profile,
+                detect_ewf1_header2_profile(&payload),
+            ) {
+                *targets.format_profile_hint_only = false;
+                *targets.format_profile_detected_from_header2 = true;
+            }
+            parse_header2_data(&payload, targets.metadata);
+        }
+        "xheader" => parse_xheader_data(&payload()?, targets.metadata),
+        "error2" => targets
+            .acquisition_errors
+            .extend(parse_error2_data(data).map_err(damaged)?),
+        "session" => {
+            let sector_count = sector_count.ok_or_else(|| {
+                MetadataError::Damaged(EwfError::Malformed(
+                    "EWF1 session section has no media geometry to inherit".into(),
+                ))
+            })?;
+            let parsed_sessions = parse_session_data(data, 1, sector_count).map_err(damaged)?;
+            targets.sessions.extend(parsed_sessions.sessions);
+            targets.tracks.extend(parsed_sessions.tracks);
+        }
+        "hash" => {
+            validate_adler32_checksum(data, 32, 32, "EWF1 MD5 hash").map_err(damaged)?;
+            if let Some(hash) = parse_nonzero_hash::<16>(data) {
+                insert_hash_value(targets.stored_hashes, "MD5", &hash)?;
+            }
+        }
+        "digest" => {
+            validate_adler32_checksum(data, 76, 76, "EWF1 digest").map_err(damaged)?;
+            if let Some(hash) = parse_nonzero_hash::<16>(&data[..16]) {
+                insert_hash_value(targets.stored_hashes, "MD5", &hash)?;
+            }
+            if let Some(hash) = parse_nonzero_hash::<20>(&data[16..36]) {
+                insert_hash_value(targets.stored_hashes, "SHA1", &hash)?;
+            }
+        }
+        "xhash" => {
+            // Malformed or conflicting values in an intact section still fail.
+            let mut parsed = targets.stored_hashes.clone();
+            parse_xhash_data(&payload()?, &mut parsed)?;
+            *targets.stored_hashes = parsed;
+        }
+        "ltree" => merge_single_files(
+            targets.single_files,
+            Some(parse_ewf1_ltree_data(data).map_err(damaged)?),
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// True when `data` starts like a zlib stream but does not decompress, which is
+/// how damage to a compressed metadata section shows.
+fn zlib_payload_is_damaged(data: &[u8]) -> bool {
+    let [cmf, flg, ..] = *data else {
+        return false;
+    };
+    let looks_like_zlib = cmf & 0x0f == 8 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0;
+    if !looks_like_zlib {
+        return false;
+    }
+    let mut decompressed = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .take(MAX_DECOMPRESSED_METADATA + 1)
+        .read_to_end(&mut decompressed)
+        .is_err()
 }
 
 fn ewf1_media_type(value: u8) -> MediaType {
@@ -3207,7 +3346,7 @@ fn parse_segment(
     first_path: &Path,
     segment_index: usize,
     ewf1_context: Ewf1SegmentContext,
-    strictness: OpenStrictness,
+    leniency: &mut Leniency,
     header_codepage: HeaderCodepage,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<ParsedSegment> {
@@ -3218,17 +3357,17 @@ fn parse_segment(
         parse_ewf1_segment(
             file,
             segment_index,
-            ewf1_context.first_chunk,
-            ewf1_context.inherited_media_geometry,
+            ewf1_context,
             // Extensions advance EZZ -> FAA (and can eventually reach Sxx).
             // Family hints belong to the first segment, never the continuation
             // name. Explicit metadata in each segment is still checked below.
             ewf1_format_profile_hint_from_path(first_path),
             header_codepage,
+            leniency,
             statistics,
         )
     } else if signature == ewf2::EX01_SIGNATURE || signature == ewf2::LEF2_SIGNATURE {
-        parse_ewf2_segment(file, segment_index, strictness, statistics)
+        parse_ewf2_segment(file, segment_index, leniency, statistics)
     } else {
         Err(EwfError::InvalidSignature)
     }
@@ -3237,9 +3376,14 @@ fn parse_segment(
 fn parse_ewf2_segment(
     file: &mut dyn SegmentReader,
     segment_index: usize,
-    strictness: OpenStrictness,
+    leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<ParsedSegment> {
+    let strictness = if leniency.is_lenient() {
+        OpenStrictness::Lenient
+    } else {
+        OpenStrictness::Strict
+    };
     let mut header = [0; ewf2::FILE_HEADER_SIZE];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
@@ -3285,144 +3429,206 @@ fn parse_ewf2_segment(
     let mut device_information = None;
     let mut case_data = None;
     for section in &sections {
-        match section.desc.section_type {
-            ewf2::SectionType::DeviceInformation => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let data = ewf2_metadata_payload(&data, header.compression_method)?;
-                remember_ewf2_metadata_payload(
-                    &mut device_information,
-                    &data,
-                    "device information",
-                )?;
-                parse_ewf2_device_info_values(&data, &mut metadata);
-                let geometry = parse_ewf2_device_info(&data)?;
-                if let Some(size) = geometry.chunk_size {
-                    chunk_size = size;
+        if let ewf2::SectionType::Unknown(value) = section.desc.section_type {
+            // Strict opening rejects unknown types while scanning the chain.
+            leniency.record(
+                DefectKind::Irregular,
+                Some(segment_index),
+                Some(section.desc.offset),
+                format!("skipped unknown EWF2 section type 0x{value:x}"),
+            );
+            continue;
+        }
+        // Each arm validates the section before storing any of its values, so a
+        // damaged section that lenient opening skips contributes nothing.
+        let result = (|| -> std::result::Result<(), MetadataError> {
+            match section.desc.section_type {
+                ewf2::SectionType::DeviceInformation => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let data =
+                        ewf2_metadata_payload(&data, header.compression_method).map_err(damaged)?;
+                    let geometry = parse_ewf2_device_info(&data).map_err(damaged)?;
+                    remember_ewf2_metadata_payload(
+                        &mut device_information,
+                        &data,
+                        "device information",
+                    )?;
+                    parse_ewf2_device_info_values(&data, &mut metadata);
+                    if let Some(size) = geometry.chunk_size {
+                        chunk_size = size;
+                    }
+                    if let Some(size) = geometry.logical_size {
+                        logical_size = size;
+                    }
+                    apply_ewf2_geometry(&mut media, geometry);
                 }
-                if let Some(size) = geometry.logical_size {
-                    logical_size = size;
+                ewf2::SectionType::CaseData => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let data =
+                        ewf2_metadata_payload(&data, header.compression_method).map_err(damaged)?;
+                    let geometry = parse_ewf2_device_info(&data).map_err(damaged)?;
+                    remember_ewf2_metadata_payload(&mut case_data, &data, "case data")?;
+                    parse_ewf2_case_data(&data, &mut metadata);
+                    if chunk_size == 0
+                        && let Some(size) = geometry.chunk_size
+                    {
+                        chunk_size = size;
+                    }
+                    if logical_size == 0
+                        && let Some(size) = geometry.logical_size
+                    {
+                        logical_size = size;
+                    }
+                    apply_ewf2_geometry_if_missing(&mut media, geometry);
                 }
-                apply_ewf2_geometry(&mut media, geometry);
-            }
-            ewf2::SectionType::CaseData => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                let data = ewf2_metadata_payload(&data, header.compression_method)?;
-                remember_ewf2_metadata_payload(&mut case_data, &data, "case data")?;
-                parse_ewf2_case_data(&data, &mut metadata);
-                let geometry = parse_ewf2_device_info(&data)?;
-                if chunk_size == 0
-                    && let Some(size) = geometry.chunk_size
-                {
-                    chunk_size = size;
+                ewf2::SectionType::Md5Hash => {
+                    validate_hash_section_size(
+                        section.data_size,
+                        EWF2_HASH_SECTION_SIZE,
+                        "EWF2 MD5",
+                    )
+                    .map_err(damaged)?;
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    validate_adler32_checksum(&data, 16, 16, "EWF2 MD5 hash").map_err(damaged)?;
+                    if let Some(hash) = parse_nonzero_hash::<16>(&data) {
+                        insert_hash_value(&mut stored_hashes, "MD5", &hash)?;
+                    }
                 }
-                if logical_size == 0
-                    && let Some(size) = geometry.logical_size
-                {
-                    logical_size = size;
+                ewf2::SectionType::Sha1Hash => {
+                    validate_hash_section_size(
+                        section.data_size,
+                        EWF2_HASH_SECTION_SIZE,
+                        "EWF2 SHA1",
+                    )
+                    .map_err(damaged)?;
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    validate_adler32_checksum(&data, 20, 20, "EWF2 SHA1 hash").map_err(damaged)?;
+                    if let Some(hash) = parse_nonzero_hash::<20>(&data) {
+                        insert_hash_value(&mut stored_hashes, "SHA1", &hash)?;
+                    }
                 }
-                apply_ewf2_geometry_if_missing(&mut media, geometry);
-            }
-            ewf2::SectionType::Md5Hash => {
-                validate_hash_section_size(section.data_size, EWF2_HASH_SECTION_SIZE, "EWF2 MD5")?;
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                validate_adler32_checksum(&data, 16, 16, "EWF2 MD5 hash")?;
-                if let Some(hash) = parse_nonzero_hash::<16>(&data) {
-                    insert_hash_value(&mut stored_hashes, "MD5", &hash)?;
+                ewf2::SectionType::ErrorTable => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    acquisition_errors.extend(parse_ewf2_error_table_data(&data).map_err(damaged)?);
                 }
-            }
-            ewf2::SectionType::Sha1Hash => {
-                validate_hash_section_size(section.data_size, EWF2_HASH_SECTION_SIZE, "EWF2 SHA1")?;
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                validate_adler32_checksum(&data, 20, 20, "EWF2 SHA1 hash")?;
-                if let Some(hash) = parse_nonzero_hash::<20>(&data) {
-                    insert_hash_value(&mut stored_hashes, "SHA1", &hash)?;
+                ewf2::SectionType::MemoryExtentsTable => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    memory_extents.extend(parse_ewf2_memory_extents_table(&data).map_err(damaged)?);
                 }
+                ewf2::SectionType::SingleFilesData => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let parsed = parse_ewf2_single_files_data(&data).map_err(damaged)?;
+                    merge_single_files(&mut single_files, Some(parsed))?;
+                }
+                ewf2::SectionType::SingleFilesTable => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let parsed = parse_ewf2_single_files_aux_u64_table(
+                        &data,
+                        "EWF2 single files 0x21 table",
+                    )
+                    .map_err(damaged)?;
+                    merge_single_files_aux_u64_table(
+                        &mut ewf2_single_files_tables.table_0x21_entries,
+                        parsed,
+                        "0x21",
+                    )?;
+                }
+                ewf2::SectionType::SingleFilesMd5HashTable => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let parsed = parse_ewf2_single_files_md5_hash_table(&data).map_err(damaged)?;
+                    merge_single_files_aux_md5_table(
+                        &mut ewf2_single_files_tables.md5_hashes,
+                        parsed,
+                    )?;
+                }
+                ewf2::SectionType::SingleFilesUnknownTable => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    let parsed = parse_ewf2_single_files_aux_u64_table(
+                        &data,
+                        "EWF2 single files 0x23 table",
+                    )
+                    .map_err(damaged)?;
+                    merge_single_files_aux_u64_table(
+                        &mut ewf2_single_files_tables.table_0x23_entries,
+                        parsed,
+                        "0x23",
+                    )?;
+                }
+                ewf2::SectionType::IncrementData => {
+                    ewf2_increment_data.push(read_exact_at(
+                        file,
+                        section.data_offset,
+                        section.data_size,
+                    )?);
+                }
+                ewf2::SectionType::FinalInformation => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    merge_optional_ewf2_raw_section(
+                        &mut ewf2_final_information,
+                        Some(data),
+                        "final information",
+                    )?;
+                }
+                ewf2::SectionType::RestartData => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    ewf2_restart_data = Some(
+                        decode_ewf2_string_section(
+                            &data,
+                            header.compression_method,
+                            "restart data",
+                        )
+                        .map_err(damaged)?,
+                    );
+                }
+                ewf2::SectionType::AnalyticalData => {
+                    let data = read_exact_at(file, section.data_offset, section.data_size)?;
+                    ewf2_analytical_data = Some(
+                        decode_ewf2_string_section(
+                            &data,
+                            header.compression_method,
+                            "analytical data",
+                        )
+                        .map_err(damaged)?,
+                    );
+                }
+                ewf2::SectionType::SessionTable => {
+                    session_table_data.push((
+                        section.desc.offset,
+                        read_exact_at(file, section.data_offset, section.data_size)?,
+                    ));
+                }
+                _ => {}
             }
-            ewf2::SectionType::ErrorTable => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                acquisition_errors.extend(parse_ewf2_error_table_data(&data)?);
-            }
-            ewf2::SectionType::MemoryExtentsTable => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                memory_extents.extend(parse_ewf2_memory_extents_table(&data)?);
-            }
-            ewf2::SectionType::SingleFilesData => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_single_files(
-                    &mut single_files,
-                    Some(parse_ewf2_single_files_data(&data)?),
-                )?;
-            }
-            ewf2::SectionType::SingleFilesTable => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_single_files_aux_u64_table(
-                    &mut ewf2_single_files_tables.table_0x21_entries,
-                    parse_ewf2_single_files_aux_u64_table(&data, "EWF2 single files 0x21 table")?,
-                    "0x21",
-                )?;
-            }
-            ewf2::SectionType::SingleFilesMd5HashTable => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_single_files_aux_md5_table(
-                    &mut ewf2_single_files_tables.md5_hashes,
-                    parse_ewf2_single_files_md5_hash_table(&data)?,
-                )?;
-            }
-            ewf2::SectionType::SingleFilesUnknownTable => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_single_files_aux_u64_table(
-                    &mut ewf2_single_files_tables.table_0x23_entries,
-                    parse_ewf2_single_files_aux_u64_table(&data, "EWF2 single files 0x23 table")?,
-                    "0x23",
-                )?;
-            }
-            ewf2::SectionType::IncrementData => {
-                ewf2_increment_data.push(read_exact_at(
-                    file,
-                    section.data_offset,
-                    section.data_size,
-                )?);
-            }
-            ewf2::SectionType::FinalInformation => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                merge_optional_ewf2_raw_section(
-                    &mut ewf2_final_information,
-                    Some(data),
-                    "final information",
-                )?;
-            }
-            ewf2::SectionType::RestartData => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                ewf2_restart_data = Some(decode_ewf2_string_section(
-                    &data,
-                    header.compression_method,
-                    "restart data",
-                )?);
-            }
-            ewf2::SectionType::AnalyticalData => {
-                let data = read_exact_at(file, section.data_offset, section.data_size)?;
-                ewf2_analytical_data = Some(decode_ewf2_string_section(
-                    &data,
-                    header.compression_method,
-                    "analytical data",
-                )?);
-            }
-            ewf2::SectionType::SessionTable => {
-                session_table_data.push(read_exact_at(
-                    file,
-                    section.data_offset,
-                    section.data_size,
-                )?);
-            }
-            _ => {}
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {}
+            Err(MetadataError::Damaged(error)) => leniency.tolerate(
+                error,
+                DefectKind::MetadataUnavailable,
+                segment_index,
+                section.desc.offset,
+                "the section's values are not used",
+            )?,
+            Err(MetadataError::Fatal(error)) => return Err(error),
         }
     }
 
     let media_sector_count = media.sector_count.unwrap_or(0);
-    for data in session_table_data {
-        let parsed_sessions = parse_session_data(&data, 2, media_sector_count)?;
-        sessions.extend(parsed_sessions.sessions);
-        tracks.extend(parsed_sessions.tracks);
+    for (descriptor_offset, data) in session_table_data {
+        match parse_session_data(&data, 2, media_sector_count) {
+            Ok(parsed_sessions) => {
+                sessions.extend(parsed_sessions.sessions);
+                tracks.extend(parsed_sessions.tracks);
+            }
+            Err(error) => leniency.tolerate(
+                error,
+                DefectKind::MetadataUnavailable,
+                segment_index,
+                descriptor_offset,
+                "the session table's values are not used",
+            )?,
+        }
     }
 
     if chunk_size == 0 {

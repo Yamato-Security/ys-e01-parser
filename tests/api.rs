@@ -68,10 +68,10 @@ fn password_errors_do_not_require_secret_context() {
 }
 
 #[test]
-fn open_options_default_is_strict_with_bounded_cache() {
+fn open_options_default_is_lenient_with_bounded_cache() {
     let options = OpenOptions::default();
 
-    assert_eq!(options.strictness(), OpenStrictness::Strict);
+    assert_eq!(options.strictness(), OpenStrictness::Lenient);
     assert_eq!(
         options.chunk_cache_capacity(),
         ChunkCacheCapacity::Chunks(64)
@@ -87,7 +87,7 @@ fn open_options_default_is_strict_with_bounded_cache() {
 #[test]
 fn open_options_builders_configure_reader_controls() {
     let options = OpenOptions::default()
-        .with_strictness(OpenStrictness::Lenient)
+        .with_strictness(OpenStrictness::Strict)
         .with_chunk_cache_size_bytes(8 * 1024 * 1024)
         .with_table_entry_cache_size_bytes(2 * 1024 * 1024)
         .with_reader_statistics(true)
@@ -96,7 +96,7 @@ fn open_options_builders_configure_reader_controls() {
         .with_header_values_date_format(HeaderDateFormat::Iso8601)
         .with_maximum_open_handles(Some(8));
 
-    assert_eq!(options.strictness(), OpenStrictness::Lenient);
+    assert_eq!(options.strictness(), OpenStrictness::Strict);
     assert_eq!(
         options.chunk_cache_capacity(),
         ChunkCacheCapacity::Bytes(8 * 1024 * 1024)

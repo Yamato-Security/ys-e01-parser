@@ -181,6 +181,7 @@ mod image;
 mod index;
 #[cfg(feature = "verify")]
 mod integrity;
+mod lenient;
 #[cfg(feature = "verify")]
 mod logical_verify;
 mod metadata;

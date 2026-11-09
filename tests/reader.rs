@@ -37,6 +37,15 @@ struct Ewf1BytesOptions<'a> {
     media_section_type: &'a [u8],
 }
 
+/// Opens with strict structural validation. The default is lenient, so tests of
+/// strict rejection use this.
+fn open_strict(path: impl AsRef<std::path::Path>) -> ewf_image::Result<ewf_image::Image> {
+    ewf_image::Image::open_with_options(
+        path,
+        ewf_image::OpenOptions::default().with_strictness(ewf_image::OpenStrictness::Strict),
+    )
+}
+
 fn section_desc(section_type: &[u8], next: u64, size: u64) -> [u8; 76] {
     let mut desc = [0; 76];
     desc[..section_type.len()].copy_from_slice(section_type);
@@ -5208,7 +5217,7 @@ fn image_open_ignores_zero_filled_digest_hashes() {
 fn image_open_rejects_short_ewf1_digest_section() {
     let file = synthetic_e01_with_digest_payload(b"short digest", &[0xab; 36]);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -5227,7 +5236,7 @@ fn image_open_rejects_ewf1_digest_bad_checksum() {
     digest[76] ^= 0x80;
     let file = synthetic_e01_with_digest_payload(b"bad digest checksum", &digest);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -5239,7 +5248,7 @@ fn image_open_rejects_ewf1_digest_bad_checksum() {
 fn image_open_rejects_short_ewf1_hash_section() {
     let file = synthetic_e01_with_hash_payload(b"short hash", &[0xab; 16]);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -5254,7 +5263,7 @@ fn image_open_rejects_ewf1_hash_bad_checksum() {
     hash[32] ^= 0x80;
     let file = synthetic_e01_with_hash_payload(b"bad hash checksum", &hash);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6542,7 +6551,7 @@ fn image_open_ignores_zero_filled_ewf2_hashes() {
 fn image_open_rejects_short_ewf2_md5_hash_section() {
     let file = synthetic_ex01_with_md5_hash(b"short md5", &[0xab; 16]);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -6556,7 +6565,7 @@ fn image_open_rejects_ewf2_md5_hash_bad_checksum() {
     md5[16] ^= 0x80;
     let file = synthetic_ex01_with_md5_hash(b"bad md5 checksum", &md5);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6727,7 +6736,7 @@ fn image_open_rejects_ewf2_analytical_data_with_odd_utf16_size() {
         &[(0x10, b"odd".as_slice())],
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -6756,7 +6765,7 @@ fn image_open_lenient_skips_unknown_ewf2_section() {
 fn image_open_strict_rejects_unknown_ewf2_section() {
     let file = synthetic_ex01_leading_unknown_section(b"unknown strict");
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -6916,7 +6925,7 @@ fn image_rejects_unpaired_utf16_outside_entry_name() {
     catalog[offset + 4..offset + 6].copy_from_slice(&0xd800_u16.to_le_bytes());
     let file = synthetic_l01_with_ltree(b"payload", &catalog);
 
-    let error = ewf_image::Image::open(file.path()).unwrap_err();
+    let error = open_strict(file.path()).unwrap_err();
     assert!(
         error
             .to_string()
@@ -6976,7 +6985,7 @@ fn image_rejects_ewf1_ltree_text_with_bad_md5_and_valid_header_checksum() {
     bytes[offset + 24..offset + 28].copy_from_slice(&checksum.to_le_bytes());
     std::fs::write(file.path(), bytes).unwrap();
 
-    let error = ewf_image::Image::open(file.path()).unwrap_err();
+    let error = open_strict(file.path()).unwrap_err();
     assert!(error.to_string().contains("ltree text MD5 mismatch"));
 }
 
@@ -6992,7 +7001,7 @@ fn image_rejects_ewf1_ltree_without_recorded_media_size() {
     catalog[offset..offset + field.len()].copy_from_slice(&utf16le("xx"));
     let file = synthetic_l01_with_ltree(data, &catalog);
 
-    let error = ewf_image::Image::open(file.path()).unwrap_err();
+    let error = open_strict(file.path()).unwrap_err();
     assert!(
         error
             .to_string()
@@ -7227,7 +7236,7 @@ fn image_open_rejects_ewf2_single_files_invalid_entry_base16_value() {
         &single_files_stream_with_invalid_entry_base16(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7258,7 +7267,7 @@ fn image_open_rejects_ewf2_single_files_plain_entry_short_name() {
         &single_files_stream_with_plain_entry_short_name(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(
         matches!(err, ewf_image::EwfError::Malformed(message) if message.contains("short name"))
@@ -7302,7 +7311,7 @@ fn image_open_rejects_ewf2_single_files_unsupported_entry_count_shape() {
         &single_files_stream_with_unsupported_entry_count_shape(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7318,7 +7327,7 @@ fn image_open_rejects_ewf2_single_files_unsupported_entry_child_count_parent_val
         &single_files_stream_with_unsupported_entry_child_count_parent_value(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7334,7 +7343,7 @@ fn image_open_rejects_ewf2_single_files_empty_entry_type() {
         &single_files_stream_with_empty_entry_type(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7351,7 +7360,7 @@ fn image_open_rejects_ewf2_single_files_non_empty_entry_terminator() {
         &single_files_stream_with_non_empty_entry_terminator(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7367,7 +7376,7 @@ fn image_open_rejects_ewf2_single_files_non_empty_record_terminator() {
         &single_files_stream_with_non_empty_record_terminator(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7383,7 +7392,7 @@ fn image_open_rejects_ewf2_single_files_missing_record_category() {
         &single_files_stream_without_record_category(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7399,7 +7408,7 @@ fn image_open_rejects_ewf2_single_files_empty_record_type() {
         &single_files_stream_with_empty_record_type(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7416,7 +7425,7 @@ fn image_open_rejects_ewf2_single_files_non_empty_source_terminator() {
         &single_files_stream_with_non_empty_source_terminator(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7432,7 +7441,7 @@ fn image_open_rejects_ewf2_single_files_unsupported_source_count_shape() {
         &single_files_stream_with_unsupported_source_count_shape(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7448,7 +7457,7 @@ fn image_open_rejects_ewf2_single_files_extra_source_values() {
         &single_files_stream_with_extra_source_values(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7465,7 +7474,7 @@ fn image_open_rejects_ewf2_single_files_negative_source_identifier() {
         &single_files_stream_with_negative_source_identifier(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7481,7 +7490,7 @@ fn image_open_rejects_ewf2_single_files_source_identifier_index_mismatch() {
         &single_files_stream_with_mismatched_source_identifier(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7498,7 +7507,7 @@ fn image_open_rejects_ewf2_single_files_invalid_source_base16_value() {
         &single_files_stream_with_invalid_source_base16(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7515,7 +7524,7 @@ fn image_open_rejects_ewf2_single_files_extra_subject_values() {
         &single_files_stream_with_extra_subject_values(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7532,7 +7541,7 @@ fn image_open_rejects_ewf2_single_files_negative_entry_source_identifier() {
         &single_files_stream_with_negative_entry_source_identifier(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7548,7 +7557,7 @@ fn image_open_rejects_ewf2_single_files_extra_permission_values() {
         &single_files_stream_with_extra_permission_values(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7565,7 +7574,7 @@ fn image_open_rejects_ewf2_single_files_non_empty_subject_terminator() {
         &single_files_stream_with_non_empty_subject_terminator(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7581,7 +7590,7 @@ fn image_open_rejects_ewf2_single_files_non_empty_permission_terminator() {
         &single_files_stream_with_non_empty_permission_terminator(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7597,7 +7606,7 @@ fn image_open_rejects_ewf2_single_files_invalid_permission_root_type() {
         &single_files_stream_with_invalid_permission_root_type(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7613,7 +7622,7 @@ fn image_open_rejects_ewf2_single_files_invalid_permission_group_type() {
         &single_files_stream_with_invalid_permission_group_type(),
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -7978,7 +7987,7 @@ fn image_open_rejects_ewf2_memory_extents_table_partial_entry() {
     let file =
         synthetic_ex01_memory_extents_table_with_payload(b"bad memory extents", &memory_extents);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -8039,7 +8048,7 @@ fn image_open_rejects_ewf1_error2_bad_header_checksum() {
     error2[516] ^= 0x80;
     let file = synthetic_e01_with_error2_payload(b"bad error2 header", &error2);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -8053,7 +8062,7 @@ fn image_open_rejects_ewf1_error2_bad_entries_checksum() {
     error2[520] ^= 0x80;
     let file = synthetic_e01_with_error2_payload(b"bad error2 entries", &error2);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -8067,7 +8076,7 @@ fn image_open_rejects_ewf2_error_table_bad_header_checksum() {
     error_table[16] ^= 0x80;
     let file = synthetic_ex01_error_table_with_payload(b"bad error header", &error_table);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -8082,7 +8091,7 @@ fn image_open_rejects_ewf2_error_table_bad_entries_checksum() {
     error_table[32] ^= 0x80;
     let file = synthetic_ex01_error_table_with_payload(b"bad error entries", &error_table);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -8214,7 +8223,7 @@ fn image_open_rejects_ewf2_session_table_bad_header_checksum() {
     session_table[16] ^= 0xff;
     let file = synthetic_ex01_session_table_with_payload(b"session bad", &session_table);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -8226,7 +8235,7 @@ fn image_open_rejects_ewf2_session_table_bad_entries_checksum() {
     session_table[footer_offset] ^= 0xff;
     let file = synthetic_ex01_session_table_with_payload(b"session bad", &session_table);
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(err, ewf_image::EwfError::Malformed(_)));
 }
@@ -8291,7 +8300,7 @@ fn image_open_rejects_ewf2_device_info_chunk_size_overflow() {
         "2\nmain\nb\tsc\tts\n18446744073709551615\t2\t2\n\n",
     );
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,
