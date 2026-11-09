@@ -4904,7 +4904,7 @@ fn image_open_rejects_ewf1_section_bad_descriptor_checksum() {
 fn image_open_rejects_ewf1_volume_bad_checksum() {
     let file = writer_e01_with_bad_volume_checksum();
 
-    let err = ewf_image::Image::open(file.path()).unwrap_err();
+    let err = open_strict(file.path()).unwrap_err();
 
     assert!(matches!(
         err,

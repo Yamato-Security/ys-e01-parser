@@ -1508,3 +1508,26 @@ fn damaged_compression_marker_of_a_repaired_descriptor_is_not_used() {
     );
     assert_eq!(read_all(&image), written.data);
 }
+
+#[test]
+fn damaged_volume_without_a_copy_is_confirmed_by_a_partial_final_chunk() {
+    for compression in [WriteCompression::Zlib, WriteCompression::None] {
+        let mut data = media(3);
+        data.truncate(data.len() - 4096);
+        let written = write_image(
+            "image.E01",
+            WriteFormat::Ewf1Physical,
+            compression,
+            &data,
+            |_| {},
+        );
+        let volume = ewf1_section(&sections(&written.path), 0, "volume");
+        flip(&written.path, volume.data_offset + 300);
+        assert_eq!(read_all(&Image::open(&written.path).unwrap()), data);
+
+        // The sector count's lowest bit: the final chunk no longer matches.
+        flip(&written.path, volume.data_offset + 16);
+        let error = Image::open(&written.path).unwrap_err();
+        assert!(error.to_string().contains("final chunk"), "{error}");
+    }
+}

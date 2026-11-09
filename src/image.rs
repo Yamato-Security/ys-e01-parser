@@ -900,14 +900,16 @@ impl Image {
             };
             media.chunk_count = Some(discovered_table_chunks.max(media_chunks));
         }
-        if let Some(reason) = ewf1_geometry_unverified {
-            check_unverified_ewf1_geometry(
-                &reason,
+        let unverified_final_chunk = match &ewf1_geometry_unverified {
+            Some(reason) => check_unverified_ewf1_geometry(
+                reason,
                 expected_ewf1_media,
                 ewf1_positions_known,
                 discovered_table_chunks,
-            )?;
-        }
+            )?
+            .then(|| reason.clone()),
+            None => None,
+        };
         if let Some((expected_size, committed_size)) = acquisition_prefix {
             if format != Format::Ewf1
                 || logical_size != expected_size
@@ -1015,7 +1017,47 @@ impl Image {
         {
             image.read_data_chunk(0)?;
         }
+        if let Some(reason) = unverified_final_chunk
+            && !image.final_chunk_confirms_media_size()
+        {
+            return Err(EwfError::Malformed(format!(
+                "{reason}; no intact copy exists and the final chunk does not confirm the media \
+                 size"
+            )));
+        }
         Ok(image)
+    }
+
+    /// Whether the final chunk, which the media does not fill, is stored with
+    /// exactly the size the media leaves for it: a raw chunk of that size plus
+    /// a matching checksum, or a zlib stream that fills its stored bytes and
+    /// decodes to exactly that size. Writers that pad the final chunk fail.
+    fn final_chunk_confirms_media_size(&self) -> bool {
+        let Ok(chunks) = crate::index::logical_chunk_count(
+            self.inner.info.logical_size,
+            self.inner.info.chunk_size,
+        ) else {
+            return false;
+        };
+        let Some(last) = chunks.checked_sub(1) else {
+            return false;
+        };
+        let Ok(chunk) = self.lookup_chunk(last) else {
+            return false;
+        };
+        let Ok(encoded) = self.read_encoded_chunk_bytes(last, chunk) else {
+            return false;
+        };
+        match chunk.encoding {
+            ChunkEncoding::Raw => {
+                chunk.validate_checksum
+                    && validate_raw_chunk_checksum(&encoded, chunk.logical_size).is_ok()
+            }
+            ChunkEncoding::Zlib => {
+                decode_zlib_exact(&encoded, chunk.logical_size, chunk.logical_size).is_ok()
+            }
+            _ => false,
+        }
     }
 
     /// Defects recorded while opening, followed by those found while reading.
@@ -3263,29 +3305,42 @@ fn zlib_stream_length(bytes: &[u8], logical: usize) -> Option<usize> {
 
 /// Accepts media geometry read from a damaged section only when the image
 /// confirms it: every segment's tables were read and together hold exactly the
-/// declared chunk count, the media fills its last chunk (so no low bit of the
-/// sector count can be wrong unnoticed), and the sector and chunk counts agree.
+/// declared chunk count, the sector and chunk counts agree, and either the
+/// media fills its last chunk or that chunk's stored size matches what is left
+/// of the media (so that no low bit of the sector count can be wrong unnoticed).
+///
+/// Returns whether the final chunk must still confirm the size: when the media
+/// does not fill its last chunk, that chunk's stored size must match the size
+/// left for it (see [`Image::final_chunk_confirms_media_size`]).
 fn check_unverified_ewf1_geometry(
     reason: &str,
     geometry: Option<Ewf1MediaGeometry>,
     all_tables_read: bool,
     table_chunks: u64,
-) -> Result<()> {
-    let confirmed = geometry.is_some_and(|geometry| {
-        let full_chunks = u64::from(geometry.chunk_count)
-            .checked_mul(geometry.chunk_size)
-            .is_some_and(|size| size == geometry.logical_size);
-        let sane = geometry.bytes_per_sector.is_power_of_two()
-            && geometry.bytes_per_sector <= 4096
-            && geometry.sectors_per_chunk.is_power_of_two();
-        all_tables_read && sane && full_chunks && table_chunks == u64::from(geometry.chunk_count)
-    });
-    if confirmed {
-        Ok(())
-    } else {
-        Err(EwfError::Malformed(format!(
+) -> Result<bool> {
+    let refused = || {
+        EwfError::Malformed(format!(
             "{reason}; no intact copy exists and the chunk tables do not confirm its values"
-        )))
+        ))
+    };
+    let geometry = geometry.ok_or_else(refused)?;
+    let full_chunks = u64::from(geometry.chunk_count)
+        .checked_mul(geometry.chunk_size)
+        .is_some_and(|size| size == geometry.logical_size);
+    let chunk_count_agrees =
+        crate::index::logical_chunk_count(geometry.logical_size, geometry.chunk_size)
+            .is_ok_and(|count| count == u64::from(geometry.chunk_count));
+    let sane = geometry.bytes_per_sector.is_power_of_two()
+        && geometry.bytes_per_sector <= 4096
+        && geometry.sectors_per_chunk.is_power_of_two();
+    if all_tables_read
+        && sane
+        && chunk_count_agrees
+        && table_chunks == u64::from(geometry.chunk_count)
+    {
+        Ok(!full_chunks)
+    } else {
+        Err(refused())
     }
 }
 
