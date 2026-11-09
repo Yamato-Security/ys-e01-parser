@@ -25,6 +25,8 @@ pub(crate) enum DefectKind {
     UnverifiedChunkTable,
     /// A chunk decoded to more bytes than the media holds; the extra bytes were dropped.
     OverlongChunk,
+    /// A damaged segment file header value that lenient opening did not need.
+    DamagedFileHeader,
     /// Another irregularity that lenient opening accepted.
     Irregular,
 }

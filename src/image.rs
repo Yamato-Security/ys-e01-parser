@@ -668,12 +668,26 @@ impl Image {
             let expected_segment_number = u64::try_from(segment_index + 1)
                 .map_err(|_| EwfError::Malformed("segment index overflow".into()))?;
             if parsed.segment_number != expected_segment_number {
-                return Err(EwfError::Malformed(format!(
+                let error = EwfError::Malformed(format!(
                     "segment {} declares segment number {}, expected {}",
                     segment_index + 1,
                     parsed.segment_number,
                     expected_segment_number
-                )));
+                ));
+                // The number only orders the segments. EWF2 tables place their
+                // chunks themselves, and a lone segment has no order to check, so
+                // a damaged number there changes nothing that is read.
+                if parsed.format == Format::Ewf2 || paths.len() == 1 {
+                    leniency.tolerate(
+                        error,
+                        DefectKind::DamagedFileHeader,
+                        segment_index,
+                        0,
+                        "the segment was used in the position given",
+                    )?;
+                } else {
+                    return Err(error);
+                }
             }
             validate_set_identifier(&mut expected_set_identifier, parsed.set_identifier)?;
             if let Some(observed) = parsed.ewf1_compression_method {

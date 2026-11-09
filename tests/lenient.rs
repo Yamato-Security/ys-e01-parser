@@ -1202,3 +1202,36 @@ fn media_size_recorded_in_the_metadata_survives_a_lost_table() {
     assert_eq!(image.media_size(), data.len() as u64);
     assert_eq!(readable_chunks(&image, &data), 1);
 }
+
+#[test]
+fn damaged_segment_number_is_accepted_where_it_orders_nothing() {
+    let e01 = e01(WriteCompression::Zlib, 2);
+    let ex01 = ex01(2);
+    // The EWF1 segment number is at byte 9, the EWF2 one at byte 12.
+    flip(&e01.path, 10);
+    flip(&ex01.path, 14);
+
+    for written in [&e01, &ex01] {
+        assert!(open_strict(&written.path).is_err());
+        let image = Image::open(&written.path).unwrap();
+        let findings = image.lenient_findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, IntegrityFindingKind::LenientOpen);
+        assert_eq!(findings[0].severity, ewf_image::IntegritySeverity::Error);
+        assert_eq!(read_all(&image), written.data);
+    }
+}
+
+#[test]
+fn damaged_segment_number_still_fails_a_multi_segment_ewf1_image() {
+    let written = multi_segment_e01();
+    let third = Image::open(&written.path)
+        .unwrap()
+        .segment_filename(2)
+        .unwrap()
+        .to_path_buf();
+    flip(&third, 10);
+
+    let error = Image::open(&written.path).unwrap_err();
+    assert!(error.to_string().contains("segment number"), "{error}");
+}

@@ -45,7 +45,8 @@ pub enum IntegrityFindingKind {
     /// Acquisition lacks its completed terminal marker.
     IncompleteAcquisition,
     /// Lenient opening accepted a structural irregularity not covered by a more
-    /// specific kind; the message says what was accepted.
+    /// specific kind, such as a damaged segment number it did not need or an
+    /// unknown section it skipped; the message says what was accepted.
     LenientOpen,
     /// A segment file ends inside a section. Sections that are complete are
     /// used; chunks whose data or table is missing fail when read.
@@ -198,6 +199,9 @@ fn defect_finding(defect: &Defect, chunk_size: u64) -> IntegrityFinding {
             IntegrityFindingKind::OverlongChunk,
             IntegritySeverity::Warning,
         ),
+        DefectKind::DamagedFileHeader => {
+            (IntegrityFindingKind::LenientOpen, IntegritySeverity::Error)
+        }
         DefectKind::Irregular => (
             IntegrityFindingKind::LenientOpen,
             IntegritySeverity::Warning,
