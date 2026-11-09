@@ -1,0 +1,33 @@
+# Supply-chain policy. Runs in CI on every change.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Dependencies: permissive only, so any Yamato Security tool can use this crate. RPL-1.5 is the
+# crate's own license (LICENSE); bzip2-1.0.6 is libbz2-rs-sys's (the pure-Rust bzip2 that EWF2
+# images may use).
+allow = ["RPL-1.5", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "bzip2-1.0.6"]
+unused-allowed-license = "allow"
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A reader of evidence has no business talking to the network.
+deny = [
+    { name = "reqwest" },
+    { name = "hyper" },
+    { name = "ureq" },
+    { name = "curl" },
+    { name = "isahc" },
+    { name = "surf" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
