@@ -90,6 +90,10 @@ required-features = ["writer"]
 name = "writer"
 required-features = ["writer"]
 
+[[test]]
+name = "lenient"
+required-features = ["writer"]
+
 [dependencies]
 aes = "0.9"
 bzip2 = "0.6"
