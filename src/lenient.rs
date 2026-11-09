@@ -14,14 +14,15 @@ pub(crate) enum DefectKind {
     TruncatedSegment,
     /// A damaged section descriptor stopped the section chain of a segment.
     BrokenSectionChain,
-    /// A stored structure checksum failed; the values were checked another way
-    /// or replaced by an intact copy.
+    /// A stored structure checksum failed; the values were checked another way,
+    /// replaced by an intact copy, or not used.
     ChecksumMismatch,
     /// A damaged metadata section was ignored.
     MetadataUnavailable,
     /// Chunks that cannot be located; reading them fails.
     ChunksUnavailable,
-    /// Chunk table entries failed their checksum; each chunk must verify itself.
+    /// Chunk table entries failed their checksum, or chunks were located without
+    /// a table; each such chunk must verify itself.
     UnverifiedChunkTable,
     /// A chunk decoded to more bytes than the media holds; the extra bytes were dropped.
     OverlongChunk,

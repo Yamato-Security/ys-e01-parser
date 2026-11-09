@@ -5699,8 +5699,10 @@ fn parse_ewf1_ranges(
     leniency: &mut Leniency,
     statistics: &ReaderStatisticsCollector,
 ) -> Result<Ewf1Ranges> {
-    const LATER_CHUNKS_UNKNOWN: &str = "the chunk count of this table is unknown, so the segment's later chunks cannot be \
-         placed";
+    const LATER_CHUNKS_UNKNOWN: &str = concat!(
+        "the chunk count of this table is unknown, so the segment's later chunks cannot ",
+        "be placed"
+    );
     let Ewf1RangeContext {
         segment_index,
         first_chunk,
