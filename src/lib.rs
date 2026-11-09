@@ -1,10 +1,31 @@
-//! Rust library for reading and writing Expert Witness Format forensic images.
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) 2026 Elijah Brigham
+//
+// This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
+// under the Apache License 2.0 (LICENSE-APACHE).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
+//! Rust library for reading Expert Witness Format forensic images, and with the
+//! `writer` feature, writing them.
 //!
 //! `ewf_image` provides direct Rust APIs for working with Expert Witness Format
 //! images. It can open physical, logical, SMART, and EWF2 segment families,
-//! expose metadata and stored hashes, read the logical media stream, walk
-//! logical single-file catalogs, and create EWF output. An optional acquisition
-//! CLI is available; a filesystem mount layer is not currently implemented.
+//! expose metadata and stored hashes, read the logical media stream, and walk
+//! logical single-file catalogs; with the `writer` feature, it also creates EWF
+//! output and acquires devices. Images open leniently by default: damage that
+//! the data can still be checked without is gone past and reported by
+//! `Image::lenient_findings`, and a chunk that cannot be verified fails when it
+//! is read. Juntei mounts the images it reads with ys-vhdx-mount.
 //!
 //! # Terminology
 //!
@@ -85,7 +106,11 @@
 //!
 //! # Writing
 //!
+//! Enable the `writer` feature to use these APIs.
+//!
 //! ```no_run
+//! # #[cfg(feature = "writer")]
+//! # mod example {
 //! use std::fs::File;
 //!
 //! fn main() -> ewf_image::Result<()> {
@@ -102,15 +127,19 @@
 //!
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Streaming acquisition
 //!
-//! [`AcquisitionWriter`] seals physical E01 segments as input arrives and can
-//! resume sealed checkpoints without rewriting them. It requires a known,
-//! sector-aligned source size and a filesystem supporting hard links.
+//! `AcquisitionWriter` (with the `writer` feature) seals physical E01 segments as
+//! input arrives and can resume sealed checkpoints without rewriting them. It
+//! requires a known, sector-aligned source size and a filesystem supporting hard
+//! links.
 //!
 //! ```no_run
+//! # #[cfg(feature = "writer")]
+//! # mod example {
 //! use std::fs::File;
 //! use std::ops::ControlFlow;
 //! use ewf_image::{AcquisitionOptions, AcquisitionReadOptions, AcquisitionStatus, AcquisitionWriter};
@@ -133,6 +162,7 @@
 //!     }
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Feature flags
@@ -165,6 +195,9 @@
 //! Secondary/shadow target mirroring is supported by the file-backed writer.
 //! Base-plus-overlay delta/shadow images are not implemented.
 
+// Without the writer, the helpers only it uses are unused; with --all-features (CI), unused code
+// is still an error.
+#![cfg_attr(not(feature = "writer"), allow(dead_code))]
 #![forbid(unsafe_code)]
 
 mod codepage;
@@ -178,6 +211,7 @@ mod image;
 mod index;
 #[cfg(feature = "verify")]
 mod integrity;
+mod lenient;
 #[cfg(feature = "verify")]
 mod logical_verify;
 mod metadata;
@@ -192,6 +226,7 @@ mod source;
 mod types;
 #[cfg(feature = "verify")]
 mod verify;
+#[cfg(feature = "writer")]
 mod writer;
 
 pub use encryption::{EncryptionInfo, EncryptionMethod, EwfPassword};
@@ -230,6 +265,7 @@ pub use types::{
     SingleFilePermission, SingleFilePermissionGroup, SingleFileSource, SingleFileSubject,
     SingleFilesAuxTables, SingleFilesInfo, StoredHashes,
 };
+#[cfg(feature = "writer")]
 pub use writer::{
     AcquisitionCheckpoint, AcquisitionOperationPhase, AcquisitionOperationProgress,
     AcquisitionOptions, AcquisitionOutcome, AcquisitionProgress, AcquisitionReadOptions,

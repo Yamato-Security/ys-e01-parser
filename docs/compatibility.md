@@ -1,10 +1,9 @@
 # Compatibility
 
-These tables describe the EWF development checkout. A supported operation does
-not imply that every producer variant or consumer has been tested. For changes in
-published packages, see the [changelog](../CHANGELOG.md). AFF4 profiles are
-listed in the separate
-[AFF4 guide](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image).
+These tables describe the EWF reader and writer as ebrig/ewf-image left them; in this fork the
+writer is behind the `writer` feature. A supported operation does not imply that every producer
+variant or consumer has been tested. The README's Validation section gives this fork's comparison
+with libewf.
 
 ## Reader support
 

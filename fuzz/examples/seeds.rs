@@ -1,5 +1,22 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) 2026 Elijah Brigham
+//
+// This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
+// under the Apache License 2.0 (LICENSE-APACHE).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! Generate public synthetic inputs using normal writer APIs.
-use std::{ops::ControlFlow, path::PathBuf};
+use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(
@@ -7,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nth(1)
             .unwrap_or_else(|| "corpus".into()),
     );
-    for name in ["ewf_read", "ewf_catalog", "aff4_read"] {
+    for name in ["ewf_read", "ewf_catalog"] {
         std::fs::create_dir_all(root.join(name))?;
     }
     let temporary = tempfile::tempdir()?;
@@ -31,27 +48,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write_all(&input)?;
         writer.finish()?;
         std::fs::copy(path, root.join("ewf_read").join(format!("seed{n}")))?;
-    }
-    for (n, profile) in [aff4_image::Profile::Physical, aff4_image::Profile::Logical]
-        .into_iter()
-        .enumerate()
-    {
-        let path = temporary.path().join(format!("seed{n}.aff4"));
-        let mut writer = aff4_image::Writer::create(&path, profile, Default::default())?;
-        if profile == aff4_image::Profile::Physical {
-            writer.add_image(input.len() as u64, &mut input.as_slice(), |_, _| {
-                ControlFlow::Continue(())
-            })?;
-        } else {
-            writer.add_file(
-                "sample.bin",
-                input.len() as u64,
-                &mut input.as_slice(),
-                |_, _| ControlFlow::Continue(()),
-            )?;
-        }
-        writer.finish()?;
-        std::fs::copy(path, root.join("aff4_read").join(format!("seed{n}")))?;
     }
     write_catalog_seeds(&root, temporary.path())?;
     Ok(())

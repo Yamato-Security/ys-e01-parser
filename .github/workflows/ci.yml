@@ -1,177 +1,88 @@
 name: CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      windows_device_acceptance:
-        description: Run VHDX acceptance on an elevated disposable Windows lab runner
-        type: boolean
-        default: false
-  pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  rust:
-    name: Rust checks (${{ matrix.os }})
+  check:
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add rustfmt clippy
-
-      - name: Release automation syntax
-        if: runner.os == 'Linux'
-        run: bash -n scripts/verify-release-candidate.sh
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
-        run: cargo fmt --check
-
-      - name: No-default-features test
-        run: cargo test --no-default-features --locked
-
-      - name: All-features test
-        run: cargo test --all-features --locked
-
-      - name: Default-feature verification
-        run: cargo test --locked
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Examples
-        run: cargo check --examples --all-features --locked
-
-      - name: AFF4 sibling crate
+        run: cargo fmt --all --check
+      # The reader alone, as Juntei builds it, and with every feature.
+      - name: Lint
         run: |
-          cargo fmt --all --check
-          cargo test -p aff4-image --locked
-          cargo test -p aff4-image --no-default-features --locked
-          cargo clippy -p aff4-image --no-default-features --all-targets --locked -- -D warnings
-          cargo clippy -p aff4-image --all-targets --locked -- -D warnings
-
-      - name: Doctests
-        run: cargo test --doc --all-features --locked
-
-      - name: Unified CLI
-        run: cargo test -p ewf-cli --locked
-
-      - name: Unified CLI lint
-        run: cargo clippy -p ewf-cli --all-targets --locked -- -D warnings
-
+          cargo clippy --all-targets --locked
+          cargo clippy --all-targets --all-features --locked
+      - name: Test
+        run: |
+          cargo test --locked
+          cargo test --no-default-features --locked
+          cargo test --all-features --locked
       - name: Docs
+        run: cargo doc --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
-
-      - name: Package contents
-        run: |
-          cargo package -p ewf-image --list --locked
-          cargo package -p aff4-image --list --locked
-
-      - name: Publish dry run
-        run: |
-          cargo publish -p ewf-image --dry-run --all-features --locked
-          cargo publish -p aff4-image --dry-run --all-features --locked
-
-  interoperability:
-    name: Pinned libewf interoperability
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config zlib1g-dev libbz2-dev libssl-dev dmsetup e2fsprogs util-linux
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
-      - name: Build pinned oracle
-        run: bash scripts/install-libewf-oracle.sh "$RUNNER_TEMP/libewf"
-      - name: Compare generated fixtures and writer output
-        run: bash scripts/test-interoperability.sh "$RUNNER_TEMP/libewf"
-
-      - name: Canonical AFF4 reference
-        run: bash scripts/test-aff4-reference.sh
-
-      - name: Independent AFF4 producer and consumer
-        run: bash scripts/test-aff4-interoperability.sh
-      - name: Build unified CLI
-        run: cargo build --release --locked -p ewf-cli
-      - name: Sequential EWF2 filesystem-full and cancellation acceptance
-        run: sudo python3 scripts/test-sequential-storage.py --binary "$PWD/target/release/ewf-cli"
-      - name: AFF4 filesystem-full acceptance
-        run: |
-          cargo build --release --locked -p aff4-image --example acquire
-          sudo python3 scripts/test-aff4-storage.py --acquire "$PWD/target/release/examples/acquire" --binary "$PWD/target/release/ewf-cli"
-      - name: Kernel device and filesystem acceptance
-        run: |
-          sudo python3 scripts/test-device-acquisition.py \
-            --binary "$PWD/target/release/ewf-cli" \
-            --ewfexport "$RUNNER_TEMP/libewf/bin/ewfexport" \
-            --ewfverify "$RUNNER_TEMP/libewf/bin/ewfverify" \
-            --directory "$RUNNER_TEMP"
-
-  windows-devices:
-    name: Windows VHDX acceptance (opt-in lab)
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_device_acceptance
-    runs-on: [self-hosted, Windows, ewf-device-lab]
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Build CLI
-        run: cargo build --release --locked -p ewf-cli
-      - name: Require pinned lab oracles
-        shell: pwsh
-        run: |
-          if (-not $env:EWFEXPORT -or -not $env:EWFVERIFY) { throw 'Configure pinned EWFEXPORT and EWFVERIFY paths on the lab runner' }
-      - name: Run owned VHDX tests
-        shell: pwsh
-        run: ./scripts/test-device-acquisition.ps1 -Binary ./target/release/ewf-cli.exe -Directory $env:RUNNER_TEMP -EwfExport $env:EWFEXPORT -EwfVerify $env:EWFVERIFY
-
-  fuzz-smoke:
-    name: Bounded parser fuzz smoke
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install fuzz tooling
-        run: |
-          rustup toolchain install nightly-2026-07-16 --profile minimal
-          cargo install cargo-fuzz --locked --version 0.13.2
-      - name: Seed and exercise parser targets
-        run: bash scripts/fuzz-smoke.sh 30
 
   msrv:
-    name: MSRV
+    name: MSRV (1.99)
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Check
+        run: cargo check --all-targets --all-features --locked
 
-      - name: Install Rust 1.96
+  fuzz:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Check
+        working-directory: fuzz
+        run: cargo check --bins --examples --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  # Every Rust file carries the copyright and the RPL 1.5 License Notice (the RPL's Exhibit A).
+  license-notice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every Rust file carries the RPL License Notice
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
-
-      - name: Check MSRV
-        run: cargo check --workspace --all-features --locked
+          missing=$(git ls-files '*.rs' | xargs grep -L 'subject to the Reciprocal Public License ("RPL") Version 1.5' || true)
+          if [ -n "$missing" ]; then
+            echo "::error::Add the copyright and the RPL License Notice, as at the top of the other Rust files, to:"
+            echo "$missing"
+            exit 1
+          fi

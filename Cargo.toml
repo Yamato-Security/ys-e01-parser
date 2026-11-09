@@ -1,60 +1,20 @@
 [workspace]
-members = ["crates/aff4-image", "crates/ewf-cli"]
-default-members = ["."]
 resolver = "3"
 
 [package]
-name = "ewf-image"
-version = "0.6.1"
+name = "ys-e01-parser"
+version = "1.0.0"
 edition = "2024"
-rust-version = "1.96"
-description = "Pure-Rust library for reading and writing EWF/E01 forensic disk images."
-license = "Apache-2.0"
+rust-version = "1.99"
+authors = ["Elijah Brigham", "Zach Mathis (@yamatosecurity)"]
+description = "Read-only reader of EWF (E01, Ex01, L01) forensic images, used by Juntei"
+license = "RPL-1.5 AND Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/ebrig/ewf-image"
-homepage = "https://github.com/ebrig/ewf-image"
-documentation = "https://docs.rs/ewf-image"
+repository = "https://github.com/Yamato-Security/ys-e01-parser"
+homepage = "https://github.com/Yamato-Security/ys-e01-parser"
 keywords = ["ewf", "e01", "forensics", "image", "evidence"]
 categories = ["parser-implementations", "filesystem"]
-include = [
-    "/Cargo.toml",
-    "/Cargo.lock",
-    "/LICENSE",
-    "/README.md",
-    "/RELEASING.md",
-    "/CHANGELOG.md",
-    "/SECURITY.md",
-    "/CONTRIBUTING.md",
-    "/examples/**",
-    "/src/**",
-    "/tests/api.rs",
-    "/tests/acquisition.rs",
-    "/tests/corpus.rs",
-    "/tests/encryption.rs",
-    "/tests/data/xways-encrypted/**",
-    "/tests/reader.rs",
-    "/tests/reader_performance.rs",
-    "/tests/signature.rs",
-    "/tests/writer.rs",
-    "/tests/verification.rs",
-    "/tests/sources.rs",
-    "/tests/recovery.rs",
-    "/tests/sequential.rs",
-    "/docs/architecture.md",
-    "/docs/acquisition.md",
-    "/docs/cli.md",
-    "/docs/ewf-cli.md",
-    "/docs/device-acceptance.md",
-    "/docs/assets/ewf-image-banner.png",
-    "/docs/compatibility.md",
-    "/docs/local-acceptance.md",
-    "/docs/limitations.md",
-    "/docs/migrating-to-0.2.md",
-    "/docs/migrating-to-0.3.md",
-    "/docs/migrating-to-0.5.md",
-    "/docs/testing.md",
-    "/docs/reader-analysis.md",
-]
+publish = false
 
 [lib]
 name = "ewf_image"
@@ -62,6 +22,9 @@ name = "ewf_image"
 [features]
 default = ["verify"]
 verify = []
+# Writing EWF images and acquiring devices: the tests build their images with it; readers of
+# evidence (Juntei) leave it off.
+writer = []
 parallel = ["verify", "dep:rayon"]
 serde = ["dep:serde"]
 external-fixtures = []
@@ -69,7 +32,67 @@ fuzzing = []
 
 [[example]]
 name = "sequential"
-required-features = ["verify"]
+required-features = ["verify", "writer"]
+
+[[example]]
+name = "write_image"
+required-features = ["writer"]
+
+[[example]]
+name = "write_logical"
+required-features = ["writer"]
+
+[[example]]
+name = "catalog_scale"
+required-features = ["writer"]
+
+[[test]]
+name = "acquisition"
+required-features = ["writer"]
+
+[[test]]
+name = "api"
+required-features = ["writer"]
+
+[[test]]
+name = "corpus"
+required-features = ["writer"]
+
+[[test]]
+name = "encryption"
+required-features = ["writer"]
+
+[[test]]
+name = "reader"
+required-features = ["writer"]
+
+[[test]]
+name = "reader_performance"
+required-features = ["writer"]
+
+[[test]]
+name = "recovery"
+required-features = ["writer"]
+
+[[test]]
+name = "sequential"
+required-features = ["writer"]
+
+[[test]]
+name = "sources"
+required-features = ["writer"]
+
+[[test]]
+name = "verification"
+required-features = ["writer"]
+
+[[test]]
+name = "writer"
+required-features = ["writer"]
+
+[[test]]
+name = "lenient"
+required-features = ["writer"]
 
 [dependencies]
 aes = "0.9"

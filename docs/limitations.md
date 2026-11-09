@@ -2,8 +2,6 @@
 
 Use this guide to choose supported workflows. [Compatibility](compatibility.md)
 lists implemented profiles and independent-tool coverage.
-AFF4 profiles and limits are described in the
-[AFF4 guide](https://github.com/ebrig/ewf-image/tree/main/crates/aff4-image).
 
 ## Formats and encryption
 
@@ -81,21 +79,6 @@ Drivers may keep reads pending or delay process teardown. The stopped reader own
 its buffers and handle and cannot write acquired output. Library cancellation is
 cooperative and occurs between operations.
 
-## Collection and extraction
-
-The `ewf-cli ewf collect` command records regular files and directories, Unicode
-names, and available basic timestamps. `collect` rejects links, reparse points,
-special or inaccessible entries, and names that contain catalog delimiters.
-Collection is limited to 100,000 entries and 127 directory levels. Neither
-`collect` nor the AFF4 portable collector creates a snapshot that is consistent
-across files. Collect from a stable snapshot when consistency is required.
-
-EWF collection does not capture ACLs, ADS, xattrs, or sparse allocation.
-Selective extraction can restore recorded access and modification times when
-requested. It does not restore ACLs, xattrs, ADS, Unix mode, directory metadata,
-or special objects. General filesystem mounting, service runtimes, and
-native FFI wrappers are not implemented.
-
 ## Analysis and recovery
 
 Analysis can continue after individual chunk errors. A structural failure while
@@ -110,20 +93,3 @@ table headers, and ambiguous missing middle segments are not reconstructed.
 Substituted and checksum-suspect bytes are marked explicitly in the provenance
 map and are not verified source data. See
 [recovery semantics](reader-analysis.md#damaged-image-recovery).
-
-## Device and consumer acceptance
-
-Device acquisition requires discoverable geometry, stable identifiers, and
-resolvable destination storage. Windows overlap checks cannot detect controller,
-SAN, or virtual-storage relationships that are not reported in volume disk
-extents. Device acquisition does not lock or dismount a live filesystem or
-provide a snapshot.
-
-Physical hot-unplug, actual bad media, hardware write blockers, and power loss
-require separate acceptance testing. EnCase consumer import/export has not been
-tested. The EWF2 logical writer requires chunks of at least 8 KiB: smaller
-split output crashed the pinned libewf 20260924 exporter. Split output at 8 KiB
-and the default 32 KiB passed that exporter. An older libewf 20251220 exporter
-still omitted a file from a one-file split image even at 32 KiB; its behavior
-needs separate investigation. See
-[device acceptance](device-acceptance.md).

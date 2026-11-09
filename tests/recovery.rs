@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) 2026 Elijah Brigham
+//
+// This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
+// under the Apache License 2.0 (LICENSE-APACHE).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 //! Recovery provenance, fallback, truncation, and output safety.
 use std::ops::ControlFlow;
 
@@ -144,7 +161,15 @@ fn missing_terminal_descriptor_is_recoverable() {
         .unwrap()
         .set_len(end + 10)
         .unwrap();
-    assert!(Image::open(&path).is_err());
+    let strict =
+        ewf_image::OpenOptions::default().with_strictness(ewf_image::OpenStrictness::Strict);
+    assert!(Image::open_with_options(&path, strict).is_err());
+    // Lenient opening keeps the complete sections, which include the tables.
+    let lenient = Image::open(&path).unwrap();
+    let mut read = vec![0; data.len()];
+    assert_eq!(lenient.read_at(&mut read, 0).unwrap(), data.len());
+    assert_eq!(read, data);
+    drop(lenient);
     let recovery = EwfRecovery::open(path, RecoveryOptions::default()).unwrap();
     let mut output = Vec::new();
     let report = recovery.recover_to_writer(&mut output).unwrap();

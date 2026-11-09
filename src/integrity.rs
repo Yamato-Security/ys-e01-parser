@@ -1,9 +1,27 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) 2026 Elijah Brigham
+//
+// This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
+// under the Apache License 2.0 (LICENSE-APACHE).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 use std::ops::ControlFlow;
 use std::path::Path;
 
+use crate::lenient::{Defect, DefectKind};
 use crate::{
     ComputedHashes, EwfError, EwfPassword, HashAlgorithm, HashComparison, HashReference, Image,
-    OpenStrictness, Result, SectionInfo, SectionKind, VerifyOptions, VerifyProgress,
+    Result, SectionInfo, SectionKind, VerifyOptions, VerifyProgress,
 };
 
 /// Severity of a reported integrity condition.
@@ -43,8 +61,37 @@ pub enum IntegrityFindingKind {
     AcquisitionErrors,
     /// Acquisition lacks its completed terminal marker.
     IncompleteAcquisition,
-    /// The caller opened using lenient structural validation.
+    /// Lenient opening accepted a structural irregularity not covered by a more
+    /// specific kind, such as a damaged segment number it did not need or an
+    /// unknown section it skipped; the message says what was accepted.
     LenientOpen,
+    /// A segment file ends inside a section. Sections that are complete are
+    /// used; chunks whose data or table is missing fail when read.
+    TruncatedSegment,
+    /// A damaged section descriptor could not be followed, so the rest of that
+    /// segment's section chain was ignored.
+    BrokenSectionChain,
+    /// A stored checksum of a section descriptor, media geometry, or chunk table
+    /// did not match. The message says what lenient opening did instead: used
+    /// an intact copy, used values that it could check against the rest of the
+    /// image, or left the structure unused.
+    StructureChecksumMismatch,
+    /// A damaged metadata section (header, hash, digest, error, session, or
+    /// similar) was ignored, so its values are unavailable.
+    MetadataUnavailable,
+    /// Chunk table entries failed their checksum and no intact copy exists:
+    /// reads through that table fail, because a payload checksum cannot verify
+    /// its logical position. Also used when a lost EWF1 table was recovered by
+    /// decoding chunks sequentially from a known position; only those chunks
+    /// whose complete payload checksums verify are readable.
+    UnverifiedChunkTable,
+    /// Chunks with no usable chunk table, because the table is missing from a
+    /// damaged segment or the segment's position in the media is unknown.
+    /// Reading them fails.
+    ChunksUnavailable,
+    /// A chunk decoded to more bytes than the media size leaves for it. The
+    /// media's bytes were kept and the extra bytes dropped.
+    OverlongChunk,
     /// One complete media digest differs from its reference.
     HashMismatch {
         /// Digest algorithm.
@@ -140,6 +187,54 @@ impl IntegrityReport {
     }
 }
 
+fn defect_finding(defect: &Defect, chunk_size: u64) -> IntegrityFinding {
+    let (kind, severity) = match defect.kind {
+        DefectKind::TruncatedSegment => (
+            IntegrityFindingKind::TruncatedSegment,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::BrokenSectionChain => (
+            IntegrityFindingKind::BrokenSectionChain,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::ChecksumMismatch => (
+            IntegrityFindingKind::StructureChecksumMismatch,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::UnverifiedChunkTable => (
+            IntegrityFindingKind::UnverifiedChunkTable,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::ChunksUnavailable => (
+            IntegrityFindingKind::ChunksUnavailable,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::MetadataUnavailable => (
+            IntegrityFindingKind::MetadataUnavailable,
+            IntegritySeverity::Error,
+        ),
+        DefectKind::OverlongChunk => (
+            IntegrityFindingKind::OverlongChunk,
+            IntegritySeverity::Warning,
+        ),
+        DefectKind::DamagedFileHeader => {
+            (IntegrityFindingKind::LenientOpen, IntegritySeverity::Error)
+        }
+        DefectKind::Irregular => (
+            IntegrityFindingKind::LenientOpen,
+            IntegritySeverity::Warning,
+        ),
+    };
+    let mut item = finding(kind, severity, defect.message.clone());
+    item.segment_index = defect.segment_index;
+    item.segment_offset = defect.segment_offset;
+    item.chunk_index = defect.chunk_index;
+    item.logical_offset = defect
+        .chunk_index
+        .and_then(|chunk| chunk.checked_mul(chunk_size));
+    item
+}
+
 fn finding(
     kind: IntegrityFindingKind,
     severity: IntegritySeverity,
@@ -156,18 +251,19 @@ fn finding(
     }
 }
 
-/// Opens strictly, then scans media and redundant tables.
+/// Opens with the default (lenient) options, then scans media and redundant tables.
 ///
-/// A structural opening
-/// failure is returned as one finding with unavailable media coverage; this API
-/// does not resynchronize a broken descriptor chain. Filesystem I/O errors and
-/// invalid scan options remain errors.
+/// Defects that lenient opening went past are reported as findings ahead of the
+/// media scan. An image that cannot be opened at all is returned as one finding
+/// with unavailable media coverage. Filesystem I/O errors and invalid scan
+/// options remain errors.
 pub fn analyze_path(path: impl AsRef<Path>, options: &VerifyOptions) -> Result<IntegrityReport> {
     options.validate()?;
     analyze_open_result(Image::open(path), options)
 }
 
-/// Opens strictly and analyzes with cooperative media-scan cancellation.
+/// Opens with the default (lenient) options and analyzes with cooperative
+/// media-scan cancellation.
 ///
 /// Opening and redundant-table inspection precede media progress. Retains at
 /// most 16 segment handles and disables the decoded chunk cache. Structural
@@ -254,6 +350,22 @@ fn analyze_open_with_progress(
 }
 
 impl Image {
+    /// Structural defects that lenient opening, and reading so far, went past.
+    ///
+    /// Each entry says what was damaged and what the reader did instead (used an
+    /// intact copy, checked the values another way, ignored metadata, or made the
+    /// affected chunks fail when read). Lenient opening never substitutes data:
+    /// a chunk it cannot verify fails when read. The list is empty for an image
+    /// opened with [`crate::OpenStrictness::Strict`] and for an undamaged image.
+    /// Conditions found while reading (such as an overlong final chunk) appear
+    /// once the affected chunk has been read; [`Image::analyze`] reads every chunk.
+    pub fn lenient_findings(&self) -> Vec<IntegrityFinding> {
+        self.defects()
+            .iter()
+            .map(|defect| defect_finding(defect, self.chunk_size()))
+            .collect()
+    }
+
     /// Collects media failures, redundant-table disagreements, acquisition context,
     /// and digest mismatches. Continues after chunk failures without substituting
     /// zero bytes. Structural validation is the validation performed during open.
@@ -274,15 +386,10 @@ impl Image {
         let limit = options.maximum_findings();
         let mut report = IntegrityReport::new();
         report.bytes_total = Some(self.media_size());
-        if self.open_strictness() == OpenStrictness::Lenient {
-            report.push(
-                finding(
-                    IntegrityFindingKind::LenientOpen,
-                    IntegritySeverity::Warning,
-                    "image was opened with lenient structural validation",
-                ),
-                limit,
-            );
+        let lenient_findings = self.lenient_findings();
+        let reported_lenient_findings = lenient_findings.len();
+        for item in lenient_findings {
+            report.push(item, limit);
         }
         if !self.info().acquisition_complete {
             report.push(
@@ -338,6 +445,14 @@ impl Image {
             report.push(item, limit);
             Ok(())
         })?;
+        // Reading every chunk can find more, such as an overlong final chunk.
+        for item in self
+            .lenient_findings()
+            .into_iter()
+            .skip(reported_lenient_findings)
+        {
+            report.push(item, limit);
+        }
         report.bytes_verified = scan.progress.bytes_verified;
         report.media_status = if scan.hashes.is_some() {
             MediaScanStatus::Complete

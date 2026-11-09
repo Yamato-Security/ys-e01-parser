@@ -1,3 +1,20 @@
+// Copyright (C) 2026 Shirofune Security Co., Ltd.
+// Copyright (c) 2026 Elijah Brigham
+//
+// This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
+// under the Apache License 2.0 (LICENSE-APACHE).
+//
+// Unless explicitly acquired and licensed from Licensor under another license, the contents of this
+// file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
+// allowed by the RPL, and You may not copy or use this file in either source code or executable
+// form, except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS" basis, WITHOUT WARRANTY
+// OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+// INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE, QUIET ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing rights
+// and limitations under the RPL.
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -230,10 +247,16 @@ pub struct MediaInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Strictness used while opening an image.
+///
+/// Neither mode substitutes data: a chunk that cannot be located and verified
+/// fails when read.
 pub enum OpenStrictness {
-    /// Treat structural inconsistencies as errors.
+    /// Treat any structural inconsistency as an error that fails opening.
     Strict,
-    /// Accept selected recoverable inconsistencies.
+    /// The default. Go past structural damage that the image can still be
+    /// checked without, and fail only the chunks that cannot be verified. Each
+    /// defect gone past is recorded and available from `Image::lenient_findings`
+    /// and in `Image::analyze` reports (both with the `verify` feature).
     Lenient,
 }
 
@@ -242,7 +265,7 @@ pub enum OpenStrictness {
 ///
 /// Configure values with the `with_*` builders and inspect them with getters.
 pub struct OpenOptions {
-    /// Structural validation policy.
+    /// Structural validation policy; lenient by default.
     strictness: OpenStrictness,
     /// Capacity policy for the decoded-chunk cache.
     chunk_cache_capacity: ChunkCacheCapacity,
@@ -272,7 +295,7 @@ pub enum ChunkCacheCapacity {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            strictness: OpenStrictness::Strict,
+            strictness: OpenStrictness::Lenient,
             chunk_cache_capacity: ChunkCacheCapacity::Chunks(64),
             table_entry_cache_size_bytes: 4 * 1024 * 1024,
             reader_statistics: false,
@@ -290,7 +313,8 @@ impl OpenOptions {
         self.strictness
     }
 
-    /// Sets the structural validation policy.
+    /// Sets the structural validation policy. The default is
+    /// [`OpenStrictness::Lenient`].
     #[must_use]
     pub fn with_strictness(mut self, strictness: OpenStrictness) -> Self {
         self.strictness = strictness;
