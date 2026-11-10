@@ -20,8 +20,8 @@ imported with its history. (@YamatoSecurity)
 - Writing EWF images and acquiring devices is behind the `writer` feature, off by default.
   (@YamatoSecurity)
 - Only the library is kept, without ewf-cli and the experimental AFF4 crate. Named
-  `ys-e01-parser` 1.0.0 (library `ewf_image`), on Rust 1.99, under the RPL 1.5 with the Apache
-  License 2.0 kept for ewf-image's code. (@YamatoSecurity)
+  `ys-e01-parser` 1.0.0 (library `ewf_image`), on Rust 1.99, under the RPL 1.5 or, at your choice,
+  the AGPL 3.0 only, with the Apache License 2.0 kept for ewf-image's code. (@YamatoSecurity)
 - `tests/oracle.rs` compares the reads of 13 public images with libewf's. (@YamatoSecurity)
 
 ### Fixed

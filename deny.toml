@@ -7,10 +7,10 @@ all-features = true
 yanked = "deny"
 
 [licenses]
-# Dependencies: permissive only, so any Yamato Security tool can use this crate. RPL-1.5 is the
-# crate's own license (LICENSE); bzip2-1.0.6 is libbz2-rs-sys's (the pure-Rust bzip2 that EWF2
-# images may use).
-allow = ["RPL-1.5", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "bzip2-1.0.6"]
+# Dependencies: permissive only, so any Yamato Security tool can use this crate. RPL-1.5 and
+# AGPL-3.0-only are the crate's own licenses, at the user's choice (LICENSE, LICENSE-AGPL-3.0);
+# bzip2-1.0.6 is libbz2-rs-sys's (the pure-Rust bzip2 that EWF2 images may use).
+allow = ["RPL-1.5", "AGPL-3.0-only", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "bzip2-1.0.6"]
 unused-allowed-license = "allow"
 confidence-threshold = 0.9
 
