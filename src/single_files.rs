@@ -4,6 +4,11 @@
 // This file is changed from ebrig/ewf-image (https://github.com/ebrig/ewf-image), whose code is
 // under the Apache License 2.0 (LICENSE-APACHE).
 //
+// SPDX-License-Identifier: (RPL-1.5 OR AGPL-3.0-only) AND Apache-2.0
+//
+// You may instead use this file under the GNU Affero General Public License, version 3 only
+// (LICENSE-AGPL-3.0). The notice below is for the RPL.
+//
 // Unless explicitly acquired and licensed from Licensor under another license, the contents of this
 // file are subject to the Reciprocal Public License ("RPL") Version 1.5, or subsequent versions as
 // allowed by the RPL, and You may not copy or use this file in either source code or executable

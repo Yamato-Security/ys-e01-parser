@@ -107,8 +107,10 @@ zeros, where the Rust readers read the bytes that were written. Images written b
 ## Licence
 
 ys-e01-parser is copyright Shirofune Security Co., Ltd. and released under the [Reciprocal Public
-License 1.5](LICENSE) (RPL-1.5). It is changed from [ebrig/ewf-image](https://github.com/ebrig/ewf-image)
-(copyright Elijah Brigham), whose code stays under the Apache License 2.0
-([LICENSE-APACHE](LICENSE-APACHE)): each Rust file from it says so in its header, and the crate is
-`RPL-1.5 AND Apache-2.0`. The test images keep their licences, given in
-[tests/fixtures/README.md](tests/fixtures/README.md).
+License 1.5](LICENSE) (RPL-1.5) or, at your choice, the [GNU Affero General Public License, version 3
+only](LICENSE-AGPL-3.0) (AGPL-3.0-only), so that both Juntei (RPL) and
+[Hayabusa](https://github.com/Yamato-Security/hayabusa) (AGPL) can use it. It is changed from
+[ebrig/ewf-image](https://github.com/ebrig/ewf-image) (copyright Elijah Brigham), whose code stays
+under the Apache License 2.0 ([LICENSE-APACHE](LICENSE-APACHE)): each Rust file from it says so in
+its header, and the crate is `(RPL-1.5 OR AGPL-3.0-only) AND Apache-2.0`. The test images keep
+their licences, given in [tests/fixtures/README.md](tests/fixtures/README.md).
