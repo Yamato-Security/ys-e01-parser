@@ -2236,8 +2236,7 @@ fn ewfinfo_bodyfile(
 fn crate_single_file_bodyfile_entries(image: &ewf_image::Image) -> BTreeMap<String, u64> {
     image
         .root_file_entry()
-        .map(single_file_bodyfile_entries_from_root)
-        .unwrap_or_default()
+        .map_or_default(single_file_bodyfile_entries_from_root)
 }
 
 fn single_file_bodyfile_entries_from_root(

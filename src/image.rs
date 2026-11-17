@@ -3560,8 +3560,7 @@ fn parse_ewf1_segment(
             compression_values: CompressionValues {
                 level: volume
                     .compression_level
-                    .map(|value| CompressionLevel::from_i8(value as i8))
-                    .unwrap_or_default(),
+                    .map_or_default(|value| CompressionLevel::from_i8(value as i8)),
                 ..CompressionValues::default()
             },
             media_type: volume
