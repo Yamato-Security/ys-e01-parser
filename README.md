@@ -104,6 +104,16 @@ One thing found on the way: libewf reads 3 chunks of an image written by the `wr
 zeros, where the Rust readers read the bytes that were written. Images written by libewf's
 `ewfacquire` read the same in both.
 
+## Contributing
+
+Contributions require this repository's [Contributor License Agreement](CLA.md).
+It permits **Zachary Mathis** and **Shirofune Security Co., Ltd.** to use and
+sell covered contributions in proprietary editions, while accepted contributions
+also remain available in the free, open-source community edition.
+Read [how to sign](CONTRIBUTING.md#how-to-sign). The `cla/required` check uses
+the [maintainer-verified signer registry](.github/cla/signatures.json); first-time
+signatures require verification and registration.
+
 ## Licence
 
 ys-e01-parser is copyright Shirofune Security Co., Ltd. and released under the [Reciprocal Public
