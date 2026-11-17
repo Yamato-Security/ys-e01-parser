@@ -11,7 +11,6 @@ description = "Read-only reader of EWF (E01, Ex01, L01) forensic images, used by
 license = "(RPL-1.5 OR AGPL-3.0-only) AND Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Yamato-Security/ys-e01-parser"
-homepage = "https://github.com/Yamato-Security/ys-e01-parser"
 keywords = ["ewf", "e01", "forensics", "image", "evidence"]
 categories = ["parser-implementations", "filesystem"]
 publish = false
@@ -95,25 +94,25 @@ name = "lenient"
 required-features = ["writer"]
 
 [dependencies]
-aes = "0.9"
-bzip2 = "0.6"
-ctr = "0.10"
-encoding_rs = "0.8"
-flate2 = "1"
-lru = "0.18"
-md-5 = "0.11"
-ruzstd = "0.9"
-rayon = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-sha1 = "0.11"
-sha2 = "0.11"
-subtle = "2.6"
-tempfile = "3"
-thiserror = "2"
-zeroize = { version = "1.9", features = ["derive"] }
+aes = "0.9.4"
+bzip2 = "0.6.1"
+ctr = "0.10.1"
+encoding_rs = "0.8.44"
+flate2 = "1.1.11"
+lru = "0.19.0"
+md-5 = "0.11.0"
+ruzstd = "0.9.1"
+rayon = { version = "1.12.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+zeroize = { version = "1.9.1", features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = "1.0.154"
 
 [package.metadata.docs.rs]
 all-features = true

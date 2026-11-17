@@ -3313,8 +3313,7 @@ fn ewf2_device_information_payload(
         .media_type
         .or(Some(MediaType::Removable))
         .map(ewf2_media_type_value)
-        .map(|value| value.to_string())
-        .unwrap_or_default();
+        .map_or_default(|value| value.to_string());
     let mut values = vec![
         ewf2_device_header_value(&options.metadata, "serial_number", &["sn"]),
         ewf2_device_header_value(&options.metadata, "model", &["md"]),
@@ -3354,8 +3353,7 @@ fn ewf2_device_header_value(metadata: &EwfMetadata, identifier: &str, aliases: &
                 .iter()
                 .find_map(|alias| metadata.header_values.get(*alias).map(String::as_str))
         })
-        .map(sanitize_header_value)
-        .unwrap_or_default()
+        .map_or_default(sanitize_header_value)
 }
 
 fn ewf2_media_type_value(media_type: MediaType) -> char {
@@ -3780,10 +3778,7 @@ fn single_file_source_row(source: &SingleFileSource, identifier: Option<i32>) ->
         optional_text(source.location.as_deref()),
         optional_text(source.device_guid.as_deref()),
         optional_text(source.primary_device_guid.as_deref()),
-        source
-            .drive_type
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
+        source.drive_type.map_or_default(|value| value.to_string()),
         optional_text(source.manufacturer.as_deref()),
         optional_text(source.model.as_deref()),
         optional_text(source.serial_number.as_deref()),
@@ -3938,7 +3933,7 @@ fn optional_utf16le_null_terminated(value: Option<&str>) -> Vec<u8> {
 }
 
 fn optional_text(value: Option<&str>) -> String {
-    value.map(sanitize_header_value).unwrap_or_default()
+    value.map_or_default(sanitize_header_value)
 }
 
 fn single_file_short_name_value(value: Option<&str>) -> String {
@@ -3951,7 +3946,7 @@ fn single_file_short_name_value(value: Option<&str>) -> String {
 }
 
 fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
+    value.map_or_default(|value| value.to_string())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
