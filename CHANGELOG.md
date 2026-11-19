@@ -26,6 +26,14 @@ imported with its history. (@YamatoSecurity)
 
 ### Fixed
 
+- EWF1 writers end intermediate segment files with `next`, reserving `done` for
+  the final segment. This allows libewf to open and verify split output instead
+  of stopping at the first segment or reporting a last-segment mismatch.
+  (@YamatoSecurity)
+- The EWF1 volume section of a compressed image records "good" (1) or "best" (2) compression
+  instead of "no compression" (0), as EnCase and libewf write it; `ewfinfo` and EnCase described
+  every compressed image as uncompressed. (@YamatoSecurity)
+
 - An image whose last chunk decodes to more bytes than the media needs, as some writers store it,
   failed to open; the media's bytes are read and an `OverlongChunk` warning is recorded.
   (@YamatoSecurity)
