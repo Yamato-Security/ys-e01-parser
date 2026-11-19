@@ -1470,7 +1470,7 @@ impl EwfWriter {
                         terminal_section: if is_last {
                             terminal
                         } else {
-                            TerminalSection::Done
+                            TerminalSection::Next
                         },
                     },
                 )?;
@@ -1630,7 +1630,11 @@ impl EwfWriter {
                         chunk_count: chunk_count_u32,
                         sector_count,
                         sections,
-                        terminal_section: TerminalSection::Done,
+                        terminal_section: if index + 1 == group_count {
+                            TerminalSection::Done
+                        } else {
+                            TerminalSection::Next
+                        },
                     },
                 )?;
                 writer.flush()?;

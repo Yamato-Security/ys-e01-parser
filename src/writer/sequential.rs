@@ -308,7 +308,11 @@ impl SequentialWriter {
                     chunk_count: self.total_chunks,
                     sector_count,
                     sections: Ewf1SegmentSections::for_segment(number == 1, last),
-                    terminal_section: super::TerminalSection::Done,
+                    terminal_section: if last {
+                        super::TerminalSection::Done
+                    } else {
+                        super::TerminalSection::Next
+                    },
                 },
             )?;
             if let Some(limit) = normalize_maximum_segment_size(self.options.maximum_segment_size)
