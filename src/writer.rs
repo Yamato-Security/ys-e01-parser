@@ -5157,7 +5157,8 @@ fn volume_data(options: &WriteOptions, chunk_count: u32, sector_count: u64) -> R
     volume[4..8].copy_from_slice(&chunk_count.to_le_bytes());
     volume[8..12].copy_from_slice(&options.sectors_per_chunk.to_le_bytes());
     volume[12..16].copy_from_slice(&options.bytes_per_sector.to_le_bytes());
-    volume[52] = ewf1_compression_level_value(options.compression_values.level);
+    volume[52] =
+        ewf1_compression_level_value(options.compression, options.compression_values.level);
     if options.format == WriteFormat::Ewf1Smart {
         let sector_count = u32::try_from(sector_count)
             .map_err(|_| EwfError::Unsupported("EWF-S01 writer sector count exceeds u32".into()))?;
@@ -5188,11 +5189,13 @@ fn volume_data(options: &WriteOptions, chunk_count: u32, sector_count: u64) -> R
     Ok(volume)
 }
 
-fn ewf1_compression_level_value(level: WriteCompressionLevel) -> u8 {
-    match level {
-        WriteCompressionLevel::Default | WriteCompressionLevel::None => 0,
-        WriteCompressionLevel::Fast => 1,
-        WriteCompressionLevel::Best => 2,
+/// `EnCase` records 0 for stored chunks, 1 for "good" (fast) and 2 for "best" compression. A
+/// compressed image written at the compressor's default level is "good", not "no compression".
+fn ewf1_compression_level_value(compression: WriteCompression, level: WriteCompressionLevel) -> u8 {
+    match (compression, level) {
+        (WriteCompression::None, _) | (_, WriteCompressionLevel::None) => 0,
+        (_, WriteCompressionLevel::Default | WriteCompressionLevel::Fast) => 1,
+        (_, WriteCompressionLevel::Best) => 2,
     }
 }
 
