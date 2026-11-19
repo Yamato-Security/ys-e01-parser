@@ -1,4 +1,19 @@
 {
   "schema_version": 1,
-  "agreements": []
+  "agreements": [
+    {
+      "record_id": "cla-1.1-shirofune-security-20261120",
+      "cla_version": "1.1",
+      "cla_sha256": "a374061bf964010073c50b38ade245406292ae9c1c0520432839e29fe6417458",
+      "github_user_ids": [
+        43838376
+      ],
+      "github_logins": {
+        "43838376": "Shirofune-Security"
+      },
+      "verified_by_github_user_id": 43838376,
+      "verified_at": "2026-11-19T22:03:55Z",
+      "evidence_ref": "https://github.com/Yamato-Security/ys-e01-parser/pull/5#issuecomment-7023380853"
+    }
+  ]
 }
